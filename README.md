@@ -181,7 +181,7 @@ This project is licensed under the [MIT License](LICENSE) — free to use, modif
 
 ## 🙋 作者 / Author
 
-**yuanxinxu190645** — 科研工作者 / Researcher
+**Xinyuan Xu** — 科研工作者 / Researcher
 
 如有问题或建议，欢迎提交 [Issue](https://github.com/yuanxinxu190645/Lazybones/issues)。
 
