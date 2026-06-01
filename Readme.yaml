@@ -1,0 +1,868 @@
+document_title: 文献智能抽取工具 — 提示词(Schema)编写规范
+document_version: '2.1'
+document_date: '2026-05-25'
+applicable_program: 文献智能抽取工具 Lazybones
+purpose: '本文档用于指导人工或 AI 为任意学术综述方向编写
+
+  与 Lazybones 程序兼容的 .yaml 提示词文件。
+
+  将本文档完整提供给 AI，AI 即可理解程序规范并协助编写。
+
+  v2.1 重点补充：N/A 空值统一规范、list 输出格式、enum_multi 强制约束、缓存机制、SI 处理、验证流程与 token 预算。'
+applicable_scenarios:
+- 材料科学：MOF 衍生碳、电催化剂、储能材料、涂层材料
+- 化学：有机合成方法、催化反应机理、配位化学
+- 生物医学：药物载体、纳米医学、蛋白质结构
+- 环境工程：污染物去除、光催化降解
+- 物理：薄膜制备、半导体器件
+- 任何需要从大量文献中批量提取结构化信息的综述场景
+section_1:
+  title: 一、文件格式与位置
+  rules:
+    format:
+      value: YAML(.yaml)，UTF-8 编码，无 BOM
+      notes:
+      - Windows 记事本默认保存会带 BOM，推荐用 VS Code 或 Notepad++ 编辑
+      - 缩进只能用空格，严禁制表符(Tab)，否则 YAML 解析会报错
+      - 若文件带 BOM 或编码异常，程序用 yaml.safe_load 解析时可能失败，导致该提示词版本无法加载。
+    location:
+      dev_mode: 程序源代码根目录下的 prompts/ 文件夹
+      frozen_mode: 用户安装目录下的 prompts/ 文件夹，例如 C:\Users\xxx\AppData\Local\Programs\Lazybones\prompts\
+      note: '该目录为只读，程序升级覆盖时会被替换。 用户配置和数据库在 %APPDATA%\Lazybones\ 下，不受影响。
+
+        '
+    naming_rule:
+      pattern: v{版本号}_{描述}.yaml
+      examples:
+      - v1.0_basic.yaml
+      - v2.0_HER_catalyst.yaml
+      - v1.0_ORR_MOF.yaml
+      - v1.0_drug_delivery.yaml
+      description_part_rule: 只允许字母、数字、下划线、连字符，不要用中文或空格
+    version_format:
+      pattern: 主版本.次版本，如 1.0、2.1、3.5
+      sort_note: '程序按文件名字母顺序排列版本，数字越大越靠后视为越新。 注意陷阱：字符串排序下 v10.0 < v2.0（因为字符串比较 "1" < "2"）。 如果版本号可能上 10，建议补零：v01.0、v02.0、v10.0。
+
+        '
+    multi_version: '同一程序可存放多个领域的 yaml 文件，互不干扰。 抽取页顶部下拉框切换提示词版本；审核页可按版本筛选； 数据库会记录每条记录用的是哪个版本(_schema_ver 字段)。
+
+      '
+section_1b:
+  title: 一·B、缓存机制（新手必读）
+  description: 程序为节省 API 调用费用和等待时间，对论文解析文本和 AI 抽取结果都做了缓存。新手最常见的困惑「我改了 yaml 怎么没生效？」多数是缓存命中导致。
+  text_cache:
+    location: '{project_dir}/text_cache/{paper_id}/'
+    content: 'PDF 解析后的纯文本，可能包含 [SECTION: MAIN_TEXT] / [SECTION: SUPPLEMENTARY_INFO_1] 等标记。'
+    invalidate: 重新解析 PDF 时覆盖；删除该目录可强制重新解析。
+  extract_cache:
+    location: '{project_dir}/extract_cache/{paper_id}/{schema_ver}_{lang}.json'
+    content: AI 抽取结果的原始 JSON（通常已经过空值归一化）。
+    reuse_rule: 命中条件 = 同一 paper_id + 同一 schema_ver + 同一 lang。命中时程序直接读缓存，不会再调用 AI。
+    invalidate_rule:
+    - 修改 yaml 后必须提升 meta.version（如 1.0 → 1.1），否则可能复用旧缓存。
+    - 或手动删除 extract_cache/{paper_id}/{old_ver}_{lang}.json。
+    - 若界面提供「忽略缓存」选项，可勾选后强制重新抽取。
+  common_pitfalls:
+  - 改了 description 但没改 version → AI 不会重新跑，结果不变。
+  - 改了字段 key 名但没改 version → 旧缓存里的旧 key 还在，新 key 是 N/A。
+  - 改了 system_prompt 措辞但没改 version → AI 不会重新跑。
+  golden_rule: 任何对 yaml 的修改，只要影响 AI 输出，就必须提升 meta.version。
+section_2:
+  title: 二、必须包含的顶层结构
+  required_keys:
+  - key: meta
+    description: 元数据，描述本版本基本信息
+  - key: system_prompt_zh
+    description: 中文系统提示词（角色设定和抽取规则）
+  - key: system_prompt_en
+    description: 英文系统提示词（内容与中文对应，非机器翻译）
+  - key: fields
+    description: 字段定义列表（核心部分，仅填领域专属字段）
+  note: 四个顶层键缺一不可，否则程序加载时报错
+  program_behavior: '启动时扫描 prompts/ 下所有 .yaml 文件，收集到下拉框。 用户选定某个版本后，load_schema() 会读取该文件并校验四个顶层键。 任何顶层键缺失或拼写错误，该版本不可用。
+
+    '
+section_3:
+  title: 三、meta 块规范
+  required_fields:
+    version:
+      type: 字符串（必须加引号）
+      example: '"1.0"'
+      note: 与文件名版本号一致。不加引号会被 YAML 解析成浮点数，导致后续字符串拼接出错
+    created:
+      type: 字符串
+      format: YYYY-MM-DD
+      example: '"2026-05-07"'
+    field_count:
+      type: 整数
+      note: 只统计你在 fields 列表里写的领域专属字段数量，不包含程序自动追加的 18 个身份字段（见第九节）。每次增减字段后建议同步更新。该字段主要供文档和协作者快速核对，即使当前程序不强制校验，也不要随意写错。
+    topic:
+      type: 字符串
+      example: HER 电催化剂综述
+      note: 本版本对应的综述主题，自由填写
+    description:
+      type: 字符串
+      note: 简短描述本版本的抽取重点和适用范围
+  optional_fields:
+    author:
+      type: 字符串
+      note: 编写者署名，方便多人协作时追溯
+    changelog:
+      type: 字符串
+      example: 首次发布 / 新增 Tafel_Slope 字段
+      note: 相对上一版本的主要变更
+  example: "meta:\n  version: \"1.0\"\n  created: \"2026-05-07\"\n  field_count: 20\n  topic: \"HER 电催化剂综述\"\n  description:\
+    \ \"针对 HER 单原子催化剂，重点抽取活性位点类型和电化学性能\"\n  author: \"your_name\"\n  changelog: \"首次发布\"\n"
+section_4:
+  title: 四、system_prompt 规范
+  universal_rules:
+    description: 以下七条规则无论什么综述方向都必须写进 system_prompt，缺少任何一条都会导致抽取质量下降
+    rules:
+    - index: 1
+      content: 严格基于原文，禁止推断和补全。任何字段抽不到时统一填字符串 "N/A"，包括 list 和 enum_multi 类型字段——抽不到时整个字段填 "N/A"，不要写成 [] 或 ["N/A"]。
+    - index: 2
+      content: 需要轻度推断时加前缀 "[推断]" 并简述推断依据
+    - index: 3
+      content: 数值类字段必须包含单位，如 "3.5 mA/cm²"、"0.87 V"
+    - index: 4
+      content: 枚举类字段(enum_multi)的标签必须按规定 JSON 格式输出（格式详见第六节）
+    - index: 5
+      content: 只输出合法 JSON 对象，不要任何解释文字、markdown 标记、代码围栏(```)
+    - index: 6
+      content: 区分原位(in-situ/operando)与非原位表征，仅当原文明确出现 in situ / in-situ / operando 字样时才标记为原位
+    - index: 7
+      content: JSON 输出必须包含所有 fields 列表中定义的 key，即使值为 "N/A"。不要省略任何字段，否则程序解析时该列为空
+    - index: 8
+      content: 不要在 system_prompt 里要求 AI 填写程序自动追加的身份字段（Title、Authors_Full、DOI 等），除非你明确知道程序允许覆盖。
+  domain_specific_content:
+    description: 在通用规则之后，加入领域特定的补充说明
+    items:
+    - 告知 AI 重点关注论文的哪些章节（如 Experimental、Results、Discussion、Supplementary）
+    - 列举该领域的核心关键词，帮助 AI 定向搜索（如 HER 领域：overpotential、Tafel slope、TOF）
+    - 说明该领域容易混淆的概念，要求 AI 区分（如 ORR：半波电位 vs 起始电位）
+    - 说明该领域特有的数据来源（如电化学数据通常在 CV 图、LSV 曲线中）
+    - '列出 SI 中通常出现的关键数据类型，提醒 AI 不要忽略 SI 段。程序送给 AI 的文本用 [SECTION: MAIN_TEXT] / [SECTION: SUPPLEMENTARY_INFO_1] 标记分隔'
+  anti_hallucination:
+    description: 强烈建议在 system_prompt 末尾加上以下两句，经验上能把数值类字段幻觉率压低 30%
+    sentences:
+      zh:
+      - 严禁编造原文中不存在的实验数据、化合物名称、性能指标
+      - 对每一个有数值的字段，你必须能在原文中找到对应的句子，否则填 "N/A"
+      en:
+      - Never fabricate experimental data, compound names, or performance metrics not present in the original text
+      - For every numeric field, you must be able to locate the corresponding sentence in the paper; otherwise fill "N/A"
+  format_requirements:
+  - 使用 YAML 块标量(|)保持多行格式
+  - 中英文版本内容对应，但措辞地道，不要直接机器翻译
+  - 建议长度 200~500 字。过短规则不清，过长浪费 token
+  - 科学符号格式必须在同一 schema 内统一；数据库/Excel/批量分析推荐 ASCII（如 Fe3O4、Co2+），论文排版展示可选择 Unicode。
+  - 不要在 system_prompt 里重复 fields 的 description（那些会被程序拼到 prompt 后半段），只写通用规则和领域提示，避免 prompt 膨胀
+  - 不要在 system_prompt 里提及或要求 AI 填写身份字段（Title、Authors_Full、DOI 等），程序会自动追加这些字段的指令
+  template:
+    system_prompt_zh: "你是[研究领域，如\"电化学催化\"/\"药物递送\"/\"光催化\"]领域的\n文献信息抽取专家，专注于[具体综述主题]的系统性研究。\n你的任务是从提供的论文全文（含正文和补充信息 SI）中\n\
+      精确抽取结构化信息，填入指定字段。\n\n【通用抽取规则】\n1. 严格基于原文，禁止推断和补全，找不到填 \"N/A\"\n2. 需要轻度推断时加前缀 \"[推断]\" 并说明依据\n3. 数值类字段必须包含数值和单位，如 \"\
+      [数值] [单位]\"\n4. 枚举类字段优先从预设选项选择，格式见字段说明\n5. 原位表征(in-situ/operando)与非原位严格区分，\n   仅当原文明确出现上述字样时才标记为原位\n6. 只输出合法 JSON 对象，不要任何其他文字或\
+      \ markdown 标记\n7. JSON 必须包含所有 fields 中定义的 key，缺失字段一律填 \"N/A\"\n\n【领域特定注意事项】\n- 重点关注章节：[如 Experimental、Results、Discussion]\n\
+      - 核心关键词：[如 overpotential、Tafel slope、active site]\n- 特别区分：[如 半波电位(E₁/₂) 与 起始电位(Eonset) 不可混淆]\n- SI 中的关键数据：[如 ICP-MS\
+      \ 元素含量、XPS 拟合参数]\n\n【防幻觉约束】\n- 严禁编造原文中不存在的实验数据、化合物名称、性能指标\n- 对每个有数值的字段，你必须能在原文中找到对应的句子，否则填 \"N/A\"\n"
+    system_prompt_en: 'You are a literature information extraction expert in [research field],
+
+      focusing on [specific review topic].
+
+      Extract structured information from the full paper text (main text + SI).
+
+
+      [General Rules]
+
+      1. Extract strictly from the text; do not infer or fabricate; fill "N/A" if not found
+
+      2. If light inference is needed, prefix with "[Inferred]" and state the basis
+
+      3. Numeric fields must include units, e.g., "156 mV @ 10 mA/cm²"
+
+      4. For enum_multi fields, follow the JSON format specified in each field description
+
+      5. Output only a valid JSON object; no explanatory text or markdown fences
+
+      6. Distinguish in-situ/operando from ex-situ characterization strictly
+
+      7. JSON must contain all keys defined in the fields list; fill "N/A" for missing ones
+
+
+      [Domain-Specific Notes]
+
+      - Key sections to focus on: [e.g., Experimental, Results, Discussion]
+
+      - Core keywords: [e.g., overpotential, Tafel slope, active site]
+
+      - Critical distinctions: [e.g., half-wave potential vs. onset potential]
+
+      - Key data typically in SI: [e.g., raw XPS spectra, ICP results]
+
+
+      [Anti-Hallucination Constraints]
+
+      - Never fabricate experimental data, compound names, or performance metrics
+
+      - For every numeric field, locate the corresponding sentence in the paper; otherwise fill "N/A"
+
+      '
+  empty_value_rule:
+    title: 【最高优先级】空值统一规范
+    description: 所有抽不到、原文未提及、不适用的字段都必须统一为字符串 "N/A"，不论字段类型是 text、number、list 还是 enum_multi。程序可能在 ai_client._normalize_empty_values
+      中自动归一化常见空值变体，但这会增加日志噪声和审核负担，建议直接写对。
+    forbidden_variants:
+    - list 字段填 ["N/A"]（数组包裹一个 N/A 字符串）。
+    - list 字段填 [] 或 [""] 或 [None]（空数组/空元素）。
+    - enum_multi 字段填 [{"value":"N/A","source":"...","confidence":"..."}]（只含一个 N/A 对象的退化数组）。
+    - 任何字段填 null / None / "" / "None" / "NA" / "Not mentioned"。
+    correct_examples:
+      text_field: '"N/A"'
+      number_field: '"N/A"'
+      list_field: '"N/A"  # 注意是裸字符串，不是 ["N/A"]'
+      enum_multi_field: '"N/A"  # 注意是裸字符串，不是 [] 或包了一个 N/A 对象的数组'
+    must_write_in_system_prompt: '建议把以下规则直接写入 system_prompt_zh / system_prompt_en：
+
+      任何字段抽不到、原文未提及、不适用时，统一填字符串 "N/A"。
+
+      数组类型（list/enum_multi）字段也一样：抽不到时整个字段填 "N/A"，禁止使用 [] / ["N/A"] / null / 空字符串等任何变体。'
+    program_behavior: 程序可能在 ai_client.extract_paper 返回前自动运行 _normalize_empty_values，把常见空值变体归一化为字符串 "N/A"。用户也可以在「查找替换 → 一键清理
+      N/A」对历史数据做批量归一化。
+  si_handling:
+    title: SI（Supplementary Information）文件处理
+    program_behavior: '程序会尝试识别同目录下命名相近的 SI 文件（如 paper.pdf + paper_SI.pdf），解析后用 [SECTION: MAIN_TEXT] / [SECTION: SUPPLEMENTARY_INFO_1]
+      / [SECTION: SUPPLEMENTARY_INFO_2] 等标记分隔，合并成一份文本送给 AI。'
+    yaml_writer_responsibility:
+    - 新手编写 yaml 时不需要写 SI 解析逻辑。
+    - 需要在 system_prompt 里明确提示 AI：请同时查阅正文和 SI 部分。
+    - 对 SI 中常见字段，在 description 里明确说明通常在 SI 中报道。
+    common_si_data:
+    - ICP-MS / ICP-OES 元素含量表。
+    - XPS 拟合参数和拟合谱图。
+    - BET 比表面积、孔径、孔容详细数据。
+    - 稳定性测试（CP、长循环）原始曲线。
+    - 对比实验组数据。
+  token_budget:
+    description: 提示词长度直接影响 API 费用、运行速度和上下文窗口占用。
+    estimates:
+      system_prompt: 中英文各 200~500 字，约 400~1000 tokens。
+      per_field_description: 建议 50~150 字，约 100~300 tokens。
+      total_for_20_fields: system_prompt + 字段描述 ≈ 4000~8000 tokens。
+    warning: 论文正文通常 8000~30000 tokens，加上 prompt 后可能接近某些模型的上下文上限。如果接近上限，程序可能触发分段抽取或截断，导致信息丢失。
+    optimization_tips:
+    - description 写要点而不是长篇说明，举 1~2 个例子即可。
+    - system_prompt 不要重复 fields 已说明的内容。
+    - 批量抽取优先轻量 schema；高价值文献再用深度 schema。
+    - options_zh 和 options_en 选项不要无上限扩张，优先覆盖高频标签。
+  scientific_notation_policy:
+    description: 科学符号格式应服务于数据库稳定性和下游处理。同一份 schema 内必须统一，不要一部分字段用 Unicode 下标，一部分字段用 ASCII。
+    recommended_default_for_database: ASCII scientific standard
+    ascii_examples:
+    - CO2
+    - H2/Ar
+    - Fe3O4
+    - Co3O4
+    - Fe-N4
+    - Co2+
+    - 800 °C
+    unicode_examples:
+    - CO₂
+    - H₂/Ar
+    - Fe₃O₄
+    - Co²⁺
+    rule: 如果目标是 Excel、CSV、Pandas、数据库检索和批量 AI 再分析，推荐 ASCII。如果目标是论文排版或人工展示，可在具体 schema 中明确使用 Unicode。不要在通用规范里强行绑定某一种格式。
+section_5:
+  title: 五、fields 列表规范
+  description: 'fields 是一个 YAML 列表，每个元素代表一个领域专属的抽取字段。 字段顺序即为 Excel 输出的列顺序，请按逻辑分组排列。 【重要】不需要也不应该在 fields 里定义文献身份字段 （Title、Authors_Full、DOI
+    等），程序会自动追加（详见第九节）。
+
+    '
+  required_keys_per_field:
+    key:
+      description: 字段的程序内部唯一标识符
+      naming_rules:
+      - 英文单词，下划线连接，首字母大写
+      - 示例：Overpotential、Active_Site_Type、Tafel_Slope
+      - 禁止含空格、中文、特殊符号（括号、斜杠、点等）
+      - 禁止以下划线开头——下划线前缀(_paper_id、_lang、_model、_tokens_used、_schema_ver、_added_at、_edit_log)是程序内部保留字段，你的字段会被程序忽略或覆盖
+      - key 一旦确定不要轻易修改，修改会导致历史数据该字段丢失
+      - 建议长度 ≤ 30 字符，过长会影响 Excel 列名可读性
+      - 不要使用身份字段已占用的 key（完整列表见第九节），否则程序会跳过你的定义，改用硬编码版本
+    label_zh:
+      description: 中文列名，显示在中文 Excel 表头和审核界面
+    label_en:
+      description: 英文列名，显示在英文 Excel 表头
+    type:
+      description: 字段类型，必须是以下之一
+      allowed_values:
+        text: 普通文本，AI 自由填写
+        list: 列表型；AI 输出推荐为分号+空格分隔的字符串，而不是 JSON 数组
+        number: 数值型（程序仍以 text 处理，仅作语义提示）
+        enum_multi: 枚举多选型，需配合 options 使用（见第六节）
+    required:
+      description: true 或 false
+      true_meaning: AI 必须尝试填写，实在找不到才填 N/A
+      false_meaning: 找不到可以省略，不强制填 N/A
+      warning: 不要加引号写成字符串 "true"，否则程序判断会出错
+    description_zh:
+      description: 中文字段说明（详见第七节）
+    description_en:
+      description: 英文字段说明
+  optional_keys_per_field:
+    allow_custom:
+      applicable: 仅 enum_multi 类型
+      type: true/false
+      description: 是否允许 AI 在预设选项外自创标签
+    require_evidence:
+      applicable: 仅 enum_multi 类型
+      type: true/false
+      description: 是否要求每个标签附原文证据
+    options_zh:
+      applicable: 仅 enum_multi 类型
+      description: 中文预设选项列表（YAML 列表格式）
+    options_en:
+      applicable: 仅 enum_multi 类型
+      description: 英文预设选项列表，与 options_zh 数量一致、顺序一一对应
+    default:
+      description: 字段缺省值，当 required=false 且 AI 没填时使用，默认是 "N/A"
+    excel_width:
+      description: Excel 列宽（整数，字符数，默认 20），用于控制导出表格的可读性
+      example: '长字段如 Proposed_Mechanism 可设 excel_width: 50'
+  type_output_format:
+    description: 不同 type 对应的 AI 输出 JSON 值格式。新手最容易在这里踩坑。
+    text:
+      json_value_type: 字符串
+      example: '"156 mV @ 10 mA/cm²"'
+      empty: '"N/A"'
+    number:
+      json_value_type: 字符串（程序通常按 text 处理，仅作语义提示，方便人工分辨）
+      example: '"3.5 mA/cm²"'
+      empty: '"N/A"'
+      note: 不要返回纯数字 156，必须带单位字符串，否则失去意义。
+    list:
+      json_value_type: 字符串，多个值用「分号+空格」分隔（与 Excel 导出和审核显示保持一致）
+      example: '"Ni foam; carbon paper; FTO glass"'
+      empty: '"N/A"'
+      important_note: list 类型不要返回 JSON 数组 ["a", "b", "c"]，也不要返回 enum_multi 那种对象数组。程序对 list 类型通常只做字符串处理，返回数组会导致 Excel 或审核界面格式污染。
+    enum_multi:
+      json_value_type: JSON 数组，每个元素是含 value/source/evidence/confidence 的对象
+      example:
+      - value: 协同催化
+        source: predefined
+        evidence: 原文关键句
+        confidence: high
+      empty: '"N/A"  # 注意是裸字符串，不是 [] 也不是 [{"value":"N/A",...}]'
+      note: 格式详见第六节，违反此格式视为输出错误。
+section_6:
+  title: 六、enum_multi 类型详细规范
+  description: 'enum_multi 是最重要的字段类型，适用于： 需要分类标签的行为/机制/类型字段； 一篇文献可能对应多个分类的情况； 需要追溯原文证据的关键字段。
+
+    '
+  ai_output_format:
+    description: AI 必须输出 JSON 数组，每个元素包含四个键，格式固定不可更改
+    format: "[\n  {\n    \"value\":      \"标签名称\",\n    \"source\":     \"predefined 或 ai_generated\",\n    \"evidence\":\
+      \   \"原文关键句，不超过 80 字\",\n    \"confidence\": \"high 或 medium 或 low\"\n  }\n]\n"
+    enforcement: '【强制约定，违反此格式视为输出错误】
+
+      - 必须返回 JSON 数组，即使只有一个值。
+
+      - 数组每个元素必须是包含 value/source/evidence/confidence 四个键的对象。
+
+      - 缺任何一个键，程序在渲染详情或构建问答上下文时会显示为残缺数据。
+
+      - 抽不到时整个字段填字符串 "N/A"，不要返回 [] 或 [{"value":"N/A",...}]。'
+  source_field:
+    predefined: 标签来自 options_zh 或 options_en 预设列表
+    ai_generated: '预设选项无法准确描述时 AI 自创的标签（仅当 allow_custom: true 时允许）'
+  confidence_field:
+    high: 原文明确描述，无歧义
+    medium: 原文有相关描述但需要轻度推断
+    low: 证据较弱，建议人工核查
+  custom_label_rules:
+    zh_pattern: 特征+型，如 协同增强型、界面活化型
+    en_pattern: 形容词-名词，如 Synergistic-Enhancement
+    avoid: 不要创建与预设标签含义高度重合的新标签
+    length_limit: 建议 ≤ 15 字符（中文 ≤ 8，英文 ≤ 25），过长在 Excel 和审核界面会被截断
+  evidence_writing_guide:
+    max_length: 严格控制在 80 字以内（程序对超过 120 字的会截断）
+    principle: 优先抄录原文一句完整的话，不要 paraphrase（意译会丢失证据效力）
+    multiple: 多条证据用 " / "（空格-斜杠-空格）分隔
+  program_behavior:
+    predefined: 正常显示，绿色圆点标记
+    ai_generated: 黄色背景高亮，★ 标记，加入待审核清单
+    low_confidence: 自动加入待审核清单
+    duplicate_value: 同一篇文献同一字段下出现两个相同的 value，程序自动去重，保留 confidence 最高的那条
+  description_template:
+    zh: "[字段含义说明]，可多选，输出 JSON 数组。\n每项格式：\n{\n  \"value\": \"标签名（优先从预设选项选，不够用可自创）\",\n  \"source\": \"predefined 或 ai_generated\"\
+      ,\n  \"evidence\": \"原文证据片段，≤ 80 字\",\n  \"confidence\": \"high/medium/low\"\n}\n"
+    en: "[Field meaning], multiple selection allowed. Output as JSON array.\nEach item:\n{\n  \"value\": \"label (prefer predefined\
+      \ options; custom allowed if needed)\",\n  \"source\": \"predefined or ai_generated\",\n  \"evidence\": \"original text\
+      \ excerpt, ≤ 80 chars\",\n  \"confidence\": \"high/medium/low\"\n}\n"
+section_7:
+  title: 七、description 编写规范
+  importance: description 是决定抽取准确率最关键的部分。好的 description = 准确的抽取结果。
+  required_elements:
+  - index: 1
+    name: 定义
+    content: 这个字段填什么（是什么）
+  - index: 2
+    name: 来源
+    content: 通常在论文哪里找到（哪个章节/图表）
+  - index: 3
+    name: 格式
+    content: 填写格式要求（单位、分隔符、特殊规定）
+  - index: 4
+    name: 示例
+    content: 1~3 个具体的填写例子
+  optional_elements:
+  - index: 5
+    name: 边界
+    content: 多个值怎么处理、有歧义时怎么选择
+  - index: 6
+    name: 排除
+    content: 哪些情况不属于该字段的范畴
+  - index: 7
+    name: 反例
+    content: 用 ❌ 标出常见错误填写，用 ✓ 标出正确填写，对 AI 暗示也对人工审核有提示
+  yaml_scalar_choice:
+    fold_style:
+      symbol: '>'
+      behavior: 把换行折叠成空格，适合普通段落文字
+      recommended_for: text、number 类型的普通字段
+    literal_style:
+      symbol: '|'
+      behavior: 保留所有换行，适合含 JSON 格式说明的内容
+      recommended_for: enum_multi 字段（需要保留 JSON 缩进）
+  bad_example:
+    description_zh: 催化剂的过电位
+    problem: 太简单，AI 不知道怎么填
+  good_example:
+    description_zh: 'HER 过电位，即在特定电流密度下催化剂相对于 可逆氢电极（RHE）的额外电压，体现催化活性。 通常从 LSV 曲线中读取，在 Results 章节报道。 格式：数值+单位，如 "156 mV @ 10
+      mA/cm²"。 若报道了多个电流密度下的过电位，全部列出， 如 "156 mV @ 10 mA/cm²; 298 mV @ 100 mA/cm²"。 注意：不要与起始电位（onset potential）混淆。 正确示例："156
+      mV @ 10 mA/cm²" 错误示例："约 156 mV"（缺电流密度）、"-0.156 V"（应统一用 mV）
+
+      '
+section_8:
+  title: 八、通用字段分组建议
+  description: 以下分组适用于大多数材料/化学类综述，可按需增减。用 YAML 注释标注分组便于阅读和维护。
+  important_note: '第 1 组"基本文献信息"里的所有字段（DOI、Year、Authors 等） 现已由程序硬编码为身份字段自动追加，你无需在 fields 里重复定义。 只需专注于第 2~8 组的领域专属字段即可。
+
+    '
+  groups:
+  - index: 1
+    name: 基本文献信息
+    note: 【已由程序自动追加，无需在 yaml 里写】详见第九节身份字段完整列表
+    suggested_fields:
+    - Title（自动）
+    - Authors_Full（自动）
+    - First_Author（自动）
+    - DOI（自动）
+    - Year（自动）
+    - Journal_Full（自动）
+    - Journal_Abbr（自动）
+    - 以及更多，见第九节
+  - index: 2
+    name: 样品/材料基本信息
+    note: 描述研究对象的基本属性
+    suggested_fields:
+    - 材料名称
+    - 化学组成
+    - 形貌
+    - 晶体结构
+  - index: 3
+    name: 制备/合成工艺参数
+    note: 描述如何制备样品
+    suggested_fields:
+    - 方法
+    - 温度
+    - 时间
+    - 气氛
+    - 前驱体
+  - index: 4
+    name: 核心研究内容
+    note: 综述主题的核心，最重要的模块，通常包含 enum_multi 类型的分类字段
+    suggested_fields:
+    - 活性位点类型（enum_multi）
+    - 催化机理（enum_multi）
+    - 速率决定步骤
+  - index: 5
+    name: 表征与证据
+    suggested_fields:
+    - 表征方法
+    - 是否原位
+    - 机理证据强度
+  - index: 6
+    name: 性能数据
+    suggested_fields:
+    - 过电位
+    - Tafel 斜率
+    - TOF
+    - 稳定性
+  - index: 7
+    name: 对比与结论
+    suggested_fields:
+    - 对比基准
+    - 性能归因
+    - 创新点
+  - index: 8
+    name: 附加信息
+    suggested_fields:
+    - Contradiction_Or_Debate（争议点）
+    - Notes（备注）
+  identity_field_warning: 除非你完全理解 ACS 引用格式生成机制、文献 ID 重命名功能和数据库字段映射，否则不要在 fields 里重定义身份字段。覆盖会导致引用、重命名、导出或查重功能异常。
+section_9:
+  title: 九、程序硬编码的身份字段（完整列表）
+  description: "以下 18 个字段由程序在 schema_loader.py 中硬编码（_IDENTITY_FIELDS_ZH）， 会被自动追加到每个 schema 的 fields 列表末尾。 规则：\n  1. 如果你的 yaml\
+    \ 里已定义同名 key，程序跳过追加（以你的定义为准）。\n  2. 如果你没定义，程序自动补上，AI 会被要求抽取这些字段。\n  3. 你无需也不建议在 yaml 里重复定义这些字段，除非你想覆盖默认描述。\n这些字段也是 ACS\
+    \ 引用格式自动生成和文献 ID 重命名功能的数据来源。\n"
+  identity_fields:
+  - key: Title
+    label_zh: 论文完整题目
+    label_en: Title
+    required: true
+    description_zh: 【必填】论文完整题目，原文语言，不翻译
+  - key: Authors_Full
+    label_zh: 完整作者列表
+    label_en: Authors (Full)
+    required: true
+    description_zh: 【必填】所有作者全名，分号分隔，如 Wang Lei; Li Xin
+  - key: First_Author
+    label_zh: 第一作者
+    label_en: First Author
+    required: true
+    description_zh: 【必填】第一作者全名
+  - key: Corresponding_Author
+    label_zh: 通讯作者
+    label_en: Corresponding Author
+    required: false
+    description_zh: 【选填】通讯作者全名，论文中有标注时填写，否则填 N/A
+  - key: Journal_Full
+    label_zh: 期刊全称
+    label_en: Journal (Full)
+    required: true
+    description_zh: 【必填】期刊完整名称，如 Advanced Materials
+  - key: Journal_Abbr
+    label_zh: 期刊缩写
+    label_en: Journal (Abbr.)
+    required: true
+    description_zh: 【必填】ACS 标准缩写，带点号，如 Adv. Mater.
+    special_note: '该字段在文献 ID 重命名功能中会被特殊处理： 点号（.）和空格会被自动去除，如 "Adv. Mater." → "AdvMater"， 用于生成合法的文件系统 ID。
+
+      '
+  - key: ISSN
+    label_zh: ISSN
+    label_en: ISSN
+    required: false
+    description_zh: 【选填】期刊 ISSN 号，格式 XXXX-XXXX，抽不到填 N/A
+  - key: Publisher
+    label_zh: 出版商
+    label_en: Publisher
+    required: false
+    description_zh: 【选填】出版商名称，如 Wiley、ACS、Elsevier
+  - key: Year
+    label_zh: 发表年份
+    label_en: Year
+    required: true
+    description_zh: 【必填】发表年份，4位数字字符串，如 2023
+  - key: Publication_Date
+    label_zh: 发表日期
+    label_en: Publication Date
+    required: false
+    description_zh: 【选填】完整发表日期 YYYY-MM-DD，优先取在线发表日期
+  - key: Volume
+    label_zh: 卷号
+    label_en: Volume
+    required: false
+    description_zh: 【选填】期刊卷号，纯数字，如 35
+  - key: Issue
+    label_zh: 期号
+    label_en: Issue
+    required: false
+    description_zh: 【选填】期刊期号，纯数字，如 12
+  - key: Pages
+    label_zh: 页码
+    label_en: Pages
+    required: false
+    description_zh: 【选填】页码范围，如 1234-1245 或 e202401234
+  - key: Article_Number
+    label_zh: 文章编号
+    label_en: Article Number
+    required: false
+    description_zh: 【选填】文章编号（部分期刊用编号代替页码），如 2200001
+  - key: DOI
+    label_zh: DOI
+    label_en: DOI
+    required: true
+    description_zh: 【必填】DOI，不含 https://doi.org/ 前缀，如 10.1002/adma.202200001
+  - key: Article_Type
+    label_zh: 文章类型
+    label_en: Article Type
+    required: false
+    description_zh: 【选填】文章类型，如 Research Article/Review/Communication/Letter
+  - key: Abstract_Short
+    label_zh: 摘要（简短）
+    label_en: Abstract (Short)
+    required: false
+    description_zh: 【选填】论文摘要，控制在 100 字以内的核心内容概括，不要逐句翻译
+  - key: Keywords
+    label_zh: 关键词
+    label_en: Keywords
+    required: false
+    description_zh: 【选填】论文关键词，分号分隔，最多 8 个，原文语言
+  acs_citation_format:
+    description: 程序内置 ACS 格式引用自动生成，依赖身份字段中的以下子集
+    fields_used:
+    - Authors_Full（优先）或 Authors（兼容旧字段名）
+    - Title
+    - Journal_Abbr（优先）或 Journal_Full 或 Journal（兼容旧字段名）
+    - Year
+    - Volume
+    - Issue
+    - Pages 或 Article_Number
+    - DOI
+    format_example: 'Wang, L.; Li, J.-H. Highly Active Single-Atom Catalysts for Hydrogen Evolution. ACS Nano 2024, 18 (3),
+      12345-12356. DOI: 10.1021/acsnano.4c01234
+
+      '
+    note: 缺失任一字段，引用导出时该项显示为空，整体引用仍可生成
+  consistency_check: 若怀疑文档与代码不一致，应以代码为准。可在源码中查找 schema_loader 的身份字段常量，确认字段数量和 key 列表是否与本节一致。
+section_10:
+  title: 十、paper_id 生成规则
+  description: 'paper_id 是每篇文献在程序内部的唯一标识符，由 extractor.py 自动生成， 格式为 {First_Author}_{Year}_{JournalAbbr}，如 Wang_2023_ACSNano。
+    了解生成规则有助于理解为什么有时 ID 看起来不规范，以及如何用重命名功能修正。
+
+    '
+  generation_priority:
+  - level: 1
+    name: PDF 元数据
+    description: '优先从 PDF 文件的元数据（作者、年份）+ 文件名猜测期刊缩写来生成。 格式：{第一作者姓}_{年份}_{期刊缩写}，如 Wang_2023_ACSNano。
+
+      '
+  - level: 2
+    name: 文件名解析
+    description: '元数据不可用时，从文件名提取年份，清理特殊字符后生成。 会自动剥掉文件名开头的排序序号（如 "1. Wang_2023..." → "Wang_2023..."）。
+
+      '
+  - level: 3
+    name: MD5 兜底
+    description: 以上两种方式都失败时，用文件名+文件 MD5 前 8 位生成，确保唯一性。
+  rename_feature:
+    description: '管理页的「🔧 重命名ID」功能允许用模板批量重命名 paper_id。 模板使用 {字段名} 占位符，如 {First_Author}_{Year}_{Journal_Abbr}。
+
+      '
+    special_processing:
+    - Journal_Abbr、Journal_Full、Journal 字段：点号和空格自动去除
+    - '所有字段值中的特殊字符（< > : " / \ | ? * 空格）自动替换为下划线'
+    - 连续下划线自动合并，首尾下划线去掉
+    - 字段值超过 40 字符时截断
+    - 字段值为空或 N/A 时替换为 NA
+    conflict_resolution: '批量重命名时若新 ID 与已有 ID 冲突，自动追加 _b/_c/_d 后缀区分。
+
+      '
+  database_id_format:
+    description: '数据库中实际存储的 paper_id 格式为 {base_id}__{lang}， 如 Wang_2023_ACSNano__zh 和 Wang_2023_ACSNano__en。 重命名操作会同时更新所有语言版本的记录。
+
+      '
+section_11:
+  title: 十一、不同综述方向的字段设计参考
+  example_A:
+    direction: 电催化（HER/OER/ORR）综述
+    core_fields:
+    - 'Catalyst_Composition: 催化剂组成'
+    - 'Active_Site_Type: 活性位点类型（enum_multi）'
+    - 'Electrolyte: 电解质（酸/碱/中性）'
+    - 'Overpotential: 过电位（@ 特定电流密度）'
+    - 'Tafel_Slope: Tafel 斜率（mV/dec）'
+    - 'TOF: 转换频率'
+    - 'Stability: 稳定性（时间+电流保持率）'
+    - 'Reaction_Mechanism: 反应机理（enum_multi）'
+    - 'Rate_Determining_Step: 速率决定步骤'
+  example_B:
+    direction: 药物递送/纳米医学综述
+    core_fields:
+    - 'Carrier_Type: 载体类型（enum_multi）'
+    - 'Drug_Loading: 载药量（wt%）'
+    - 'Encapsulation_Efficiency: 包封率（%）'
+    - 'Release_Trigger: 释放触发条件（enum_multi）'
+    - 'Release_Profile: 释放曲线特征'
+    - 'Target_Organ: 靶向器官/组织'
+    - 'In_Vitro_Efficacy: 体外细胞毒性（IC50 等）'
+    - 'In_Vivo_Model: 动物模型'
+    - 'Biocompatibility: 生物相容性评估'
+  example_C:
+    direction: 光催化降解综述
+    core_fields:
+    - 'Photocatalyst: 光催化剂名称'
+    - 'Light_Source: 光源（波长/强度）'
+    - 'Target_Pollutant: 目标污染物'
+    - 'Degradation_Rate: 降解率（%）'
+    - 'Rate_Constant: 速率常数（min⁻¹）'
+    - 'Mechanism_Type: 降解机理（enum_multi）'
+    - 'Reactive_Species: 活性物种（·OH、·O₂⁻ 等）'
+    - 'Bandgap: 禁带宽度（eV）'
+    - 'Reusability: 循环稳定性（次数+效率保持）'
+section_12:
+  title: 十二、完整字段示例（可直接复制修改）
+  text_type_example: "- key: Overpotential\n  label_zh: 过电位\n  label_en: Overpotential\n  type: text\n  required: true\n \
+    \ description_zh: >\n    在 10 mA/cm² 电流密度下的过电位，单位 mV。\n    从 LSV 曲线读取，通常在 Results 章节报道。\n    格式：\"156 mV @ 10 mA/cm²\"\
+    。\n    若报道多个电流密度，全部列出用分号分隔。\n    不要与起始电位混淆。\n    正确示例：\"156 mV @ 10 mA/cm²\"\n    错误示例：\"约 156 mV\"（缺电流密度）\n  description_en:\
+    \ >\n    Overpotential at 10 mA/cm², unit: mV.\n    Read from LSV curves, reported in Results section.\n    Format: \"\
+    156 mV @ 10 mA/cm²\".\n    List all reported current densities separated by semicolons.\n    Do not confuse with onset\
+    \ potential.\n"
+  enum_multi_type_example: "- key: Active_Site_Type\n  label_zh: 活性位点类型\n  label_en: Active Site Type\n  type: enum_multi\n\
+    \  required: true\n  allow_custom: true\n  require_evidence: true\n  options_zh:\n    - 单原子位点\n    - 金属纳米颗粒\n    - 金属合金\n\
+    \    - 金属化合物（氧化物/硫化物/磷化物）\n    - 缺陷位点\n    - 界面位点\n  options_en:\n    - Single-Atom-Site\n    - Metal-Nanoparticle\n \
+    \   - Metal-Alloy\n    - Metal-Compound\n    - Defect-Site\n    - Interface-Site\n  description_zh: |\n    催化活性位点的类型，可多选，输出\
+    \ JSON 数组。\n    每项格式：\n    {\n      \"value\": \"标签名（优先从预设选项选，不够用可自创）\",\n      \"source\": \"predefined 或 ai_generated\"\
+    ,\n      \"evidence\": \"原文证据片段，≤ 80 字\",\n      \"confidence\": \"high/medium/low\"\n    }\n  description_en: |\n   \
+    \ Type of catalytic active site, multiple selection allowed.\n    Output as JSON array, each item:\n    {\n      \"value\"\
+    : \"label (prefer predefined; custom allowed)\",\n      \"source\": \"predefined or ai_generated\",\n      \"evidence\"\
+    : \"original text excerpt, ≤ 80 chars\",\n      \"confidence\": \"high/medium/low\"\n    }\n"
+section_13:
+  title: 十三、常见错误与避免方法
+  errors:
+  - error: key 含中文、空格或特殊符号
+    fix: 只用英文字母和下划线：Active_Site 而非 活性位点
+  - error: key 以下划线开头（如 _my_field）
+    fix: 下划线前缀是程序保留字段，该字段会被忽略或覆盖
+  - error: 在 fields 里重复定义了身份字段（如 Title、DOI、Authors_Full）
+    fix: 这些字段程序会自动追加，你定义了程序会用你的版本，但通常没必要覆盖默认定义
+  - error: enum_multi 缺少 options_zh 或 options_en
+    fix: 两者必须同时存在，且数量一致、顺序一一对应
+  - error: options_zh 与 options_en 长度不一致
+    fix: 中英文选项必须一一对应，数量必须严格相等
+  - error: options 列表里出现重复项
+    fix: 所有 options 必须唯一，AI 看到重复选项会困惑
+  - error: description 只有一句话
+    fix: 至少包含：定义、格式要求、填写示例
+  - error: 两种语言的 system_prompt 是机器翻译
+    fix: 英文版用地道学术英文重新表述
+  - error: field_count 与实际领域字段数不一致
+    fix: field_count 只统计你写的字段，不算程序自动追加的 18 个身份字段
+  - error: 修改了已有字段的 key
+    fix: 旧缓存数据该字段将无法匹配，应新增字段而非改 key
+  - error: 数值字段没有要求单位
+    fix: description 里明确写"必须包含单位，如 X 单位"
+  - error: 领域关键词没有写进 system_prompt
+    fix: AI 不知道去哪里找数据，抽取准确率会显著下降
+  - error: 用 Tab 缩进 YAML
+    fix: YAML 严禁制表符，只能用空格（建议 2 空格）
+  - error: version 不加引号
+    fix: 'version: 1.0 会被解析为浮点数，应写 version: "1.0"'
+  - error: required 加引号写成字符串
+    fix: 'required: "true" 会被解析成字符串而非布尔值，程序判断会出错'
+  - error: description 里出现裸的双引号破坏 YAML 解析
+    fix: 用 > 或 | 多行块标量包裹，或把双引号转义成 \"
+  - error: enum_multi 或 list 字段抽不到时填 ["N/A"] 或 []
+    symptom: 数据库里出现 ["N/A"] 字面量，Excel 导出后单元格显示 ['N/A']，AI 问答上下文充满噪声。
+    fix: 统一填裸字符串 "N/A"。程序会自动归一化，但不要依赖自动修正。
+  - error: 修改 yaml 后结果没有变化
+    symptom: description、system_prompt 或字段修改后，抽取结果仍然是旧的。
+    fix: 提升 meta.version，或删除 extract_cache，或在界面勾选忽略缓存。
+  - error: list 字段返回 JSON 数组
+    symptom: 审核页或 Excel 中出现 ['a','b'] 形式的污染文本。
+    fix: list 字段返回分号+空格分隔的字符串，如 "A; B; C"。
+section_14:
+  title: 十四、给 AI 撰写提示词的指令模板
+  description: 将以下模板连同本规范文档一起提供给 AI
+  template: "我需要你帮我编写一个符合上述规范的 .yaml 提示词文件，\n用于从学术文献中批量抽取结构化信息。\n\n【综述基本信息】\n研究领域：[如 电化学催化 / 药物递送 / 光催化]\n综述主题：[如 HER 中单原子催化剂的活性位点研究]\n\
+    文献语言：[主要是英文 / 中英文混合]\n预计字段数量：[大概数量，如 20~25 个]\n\n【需要重点抽取的信息】\n[列举你关心的核心信息维度，越具体越好]\n例如：\n- 催化剂的组成和结构\n- 电化学性能数据（过电位、Tafel\
+    \ 斜率、TOF）\n- 活性位点类型（需要分类标签）\n- 反应机理（需要分类标签）\n- 稳定性测试条件和结果\n\n【需要分类标签的字段】（enum_multi 类型）\n[列举哪些字段需要预设选项，以及你能想到的分类]\n例如：\n\
+    - 活性位点类型：单原子、纳米颗粒、合金、化合物...\n- 反应机理：Volmer-Heyrovsky、Volmer-Tafel...\n\n【其他要求】\n- 版本号：v1.0\n- 注意：Title、Authors_Full、DOI、Year、Journal_Full、Journal_Abbr\
+    \ 等\n  文献身份字段由程序自动追加，不要在 fields 里定义这些字段\n- field_count 只统计领域专属字段数量，不含身份字段\n- [其他特殊要求]\n\n请严格按照规范生成完整的 yaml 文件，包含：\n1.\
+    \ meta 块（field_count 与实际领域字段数一致，不含身份字段）\n2. system_prompt_zh 和 system_prompt_en（不要机器翻译）\n3. 完整的 fields 列表，只包含领域专属字段，每个字段包含所有必要键\n\
+    4. 用 YAML 注释标注字段分组（# ── 模块名 ──）\n5. enum_multi 字段的 description 必须包含完整的 JSON 格式说明\n6. 输出前自查：\n   - field_count 是否与实际领域字段数一致（不含身份字段）\n\
+    \   - 有没有把 Title/DOI/Authors 等身份字段写进 fields（不应该写）\n   - 所有 enum_multi 字段的 options_zh 和 options_en 长度是否相等\n   - 有没有 key\
+    \ 命名违规（含中文/空格/下划线开头）\n   - version 是否加了引号\n   - required 是否是布尔值而非字符串\n"
+section_15:
+  title: 十五、版本迭代建议
+  rules:
+  - 保留所有历史版本文件，程序支持多版本共存和切换
+  - 新版本只增加字段，不修改已有字段的 key
+  - 每次迭代在 meta.description 或 meta.changelog 里记录主要变更内容
+  - 字段设计稳定后再批量处理文献，避免浪费 API 费用
+  - 建议先用 5~10 篇熟悉的文献验证效果，人工核对每个字段的抽取准确率，准确率达到满意水平后再全量运行
+  version_switch_compatibility: '数据库里每条记录都带 _schema_ver 标记。 用新版本抽取已有的论文，会在 extract_cache/{paper_id}/ 下生成新的 JSON 文件 （命名为 {新版本}_{lang}.json），不会覆盖旧版本结果。
+    审核页可按版本筛选，旧版本数据仍可正常查看和导出 Excel。
+
+    '
+  field_deprecation_strategy: '想"删除"一个字段：不要从 fields 里删， 而是把 required 改成 false，在 description 里写"已废弃，不再使用"。 这样旧数据该字段仍能在数据库里查到，新数据
+    AI 会跳过。
+
+    '
+section_16:
+  title: 十六、YAML 编写避坑速查
+  string_quoting:
+    no_quotes_ok: '单行短字符串，如 label_zh: 过电位'
+    must_quote:
+    - 含特殊字符（:、#、{、[、,）的字符串
+    - 数字字符串（版本号、年份缩写），避免被解析成数字
+    single_quote: 包含双引号的字符串用单引号包裹：'He said "hi"'
+    double_quote: 包含单引号的字符串用双引号包裹："don't"
+  multiline_strings:
+    fold:
+      symbol: '>'
+      behavior: 换行变空格，适合普通段落
+      example: "description_zh: >\n  这是第一行，\n  这是第二行。\n实际值: \"这是第一行，这是第二行。\"\n"
+    literal:
+      symbol: '|'
+      behavior: 保留换行，适合代码/JSON 格式说明
+      example: "description_zh: |\n  这是第一行，\n  这是第二行。\n实际值: \"这是第一行，\\n这是第二行。\"\n"
+  list_syntax:
+    expanded: "options_zh:\n  - 单原子位点\n  - 金属纳米颗粒\n"
+    inline: 'options_zh: [单原子位点, 金属纳米颗粒]'
+  boolean_traps:
+  - 'required: true 和 required: True 都行，推荐小写'
+  - 'required: "true" 加引号会被解析成字符串，程序判断会出错'
+  - 'required: yes / required: on 也是 true，但不推荐'
+  chinese_punctuation_note: 'YAML 语法本身只识别英文标点（:、,、-、#）。 字符串值里的中文标点（，、。、、）是正常文本，YAML 不会干涉。
+
+    '
+  troubleshooting_checklist:
+  - 检查缩进：只能用空格，不能用 Tab
+  - '检查冒号后空格：key: value，冒号后必须有空格'
+  - 检查列表的 -：- 后必须有空格
+  - 检查多行字符串的 > / |：符号后不能有任何字符，直接换行
+  - 用命令测试解析：python -c "import yaml; yaml.safe_load(open('xxx.yaml',encoding='utf-8'))"
+  - 推荐 VS Code 安装 YAML 插件，实时校验语法
+  validation_workflow:
+    title: 写完 yaml 后的标准验证流程
+    steps:
+    - step: 1
+      name: YAML 语法检查
+      command: python -c "import yaml; d=yaml.safe_load(open('prompts/v1.0_xxx.yaml',encoding='utf-8')); print('OK, top keys:',
+        list(d.keys()))"
+      expected: '输出 OK, top keys: [''meta'',''system_prompt_zh'',''system_prompt_en'',''fields'']'
+      common_errors:
+      - 'yaml.scanner.ScannerError: 缩进里混了 Tab → 全文替换为空格。'
+      - 'UnicodeDecodeError: 文件带 BOM → 用 VS Code 重新保存为 UTF-8 无 BOM。'
+      - 'yaml.constructor.ConstructorError: 字符串没加引号 → 给版本号、日期等加双引号。'
+    - step: 2
+      name: 字段定义结构检查
+      command: python -c "import yaml; d=yaml.safe_load(open('prompts/v1.0_xxx.yaml',encoding='utf-8')); allowed=('text','list','number','enum_multi');
+        [(__import__('builtins').print(f['key']), None) for f in d['fields'] if f.get('type') not in allowed]; print('All',
+        len(d['fields']), 'fields checked')"
+      expected: 输出字段数量，且无非法 type。
+    - step: 3
+      name: 程序加载验证
+      action: 重启程序 → 抽取页顶部下拉框查看新版本是否出现。
+      if_missing: 查看启动日志或控制台是否有 schema 加载错误。
+    - step: 4
+      name: 小批量试抽
+      action: 选 3~5 篇代表性文献跑一遍，进入审核页逐字段检查。
+      focus:
+      - 数值字段是否带单位。
+      - enum_multi 字段是否返回正确 JSON 数组。
+      - list 字段是否返回分号分隔字符串而非数组。
+      - 无值字段是否一律为 "N/A"，不是 ["N/A"] 或 []。
+    - step: 5
+      name: Excel 导出验证
+      action: 导出后检查列名、列顺序、单元格内容是否符合预期。
+      common_issues:
+      - 列宽过窄 → 在 fields 里给该字段加 excel_width。
+      - 列里出现 ['N/A'] 字面量 → 跑一键清理 N/A。
+      - enum_multi 显示过长 → 考虑减少证据长度或改用合并证据字段。
+document_footer:
+  document_version: '2.1'
+  update_date: '2026-05-25'
+  summary: v2.1 基于 v2.0 完整母版增补：N/A 空值统一规范、list 输出格式、enum_multi 强制格式、缓存机制、SI 文件处理、token 预算、科学符号格式策略、验证流程、常见错误扩展和身份字段保护。

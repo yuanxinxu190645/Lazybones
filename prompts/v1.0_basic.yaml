@@ -1,0 +1,203 @@
+meta:
+  version: "1.0"
+  created: "2026-05-06"
+  field_count: 17
+  description: "MOF衍生碳金属热行为基础版抽取"
+
+system_prompt_zh: |
+  你是材料科学领域的文献信息抽取专家，专注于MOF衍生碳材料的热处理过程研究。
+  你的任务是从提供的论文全文（包含正文和补充信息SI）中精确抽取结构化信息。
+
+  抽取规则：
+  1. 严格基于原文，禁止推断和补全
+  2. 原文未明确提及的字段填写 "N/A"
+  3. 需要轻度推断的内容加前缀 "[推断]"
+  4. 枚举类型字段若预设选项无法准确描述，可自创标签，并在source字段标注 "ai_generated"，同时附原文证据
+  5. 最终输出必须是合法的JSON格式，不要输出任何其他内容
+
+system_prompt_en: |
+  You are a literature information extraction expert in materials science, 
+  focusing on the thermal treatment process of MOF-derived carbon materials.
+  Your task is to accurately extract structured information from the full text 
+  of the paper provided (including main text and supplementary information SI).
+
+  Extraction rules:
+  1. Strictly based on the original text, no inference or completion
+  2. Fields not explicitly mentioned in the original text should be filled with "N/A"
+  3. Content that requires light inference should be prefixed with "[Inferred]"
+  4. For enum fields, if preset options cannot accurately describe, 
+     create a new tag and mark source as "ai_generated" with original text evidence
+  5. Final output must be valid JSON, do not output any other content
+
+fields:
+  - key: DOI
+    label_zh: DOI
+    label_en: DOI
+    type: text
+    required: true
+    description_zh: "论文的DOI编号，格式如 10.xxxx/xxxxx"
+    description_en: "DOI of the paper, format like 10.xxxx/xxxxx"
+
+  - key: Year
+    label_zh: 发表年份
+    label_en: Year
+    type: text
+    required: true
+    description_zh: "论文发表年份，4位数字"
+    description_en: "Publication year, 4-digit number"
+
+  - key: Journal
+    label_zh: 期刊名称
+    label_en: Journal
+    type: text
+    required: true
+    description_zh: "发表期刊全称"
+    description_en: "Full name of the journal"
+
+  - key: MOF_Precursor
+    label_zh: MOF前驱体
+    label_en: MOF Precursor
+    type: text
+    required: true
+    description_zh: "研究使用的MOF材料具体名称，如ZIF-8、MOF-74(Co)、HKUST-1"
+    description_en: "Specific MOF material used, e.g. ZIF-8, MOF-74(Co), HKUST-1"
+
+  - key: Metal_Node
+    label_zh: 金属节点
+    label_en: Metal Node
+    type: list
+    required: true
+    description_zh: "MOF中的金属种类，可多个，用逗号分隔，如 Zn, Co"
+    description_en: "Metal species in MOF, can be multiple, comma separated, e.g. Zn, Co"
+
+  - key: Linker
+    label_zh: 有机配体
+    label_en: Organic Linker
+    type: text
+    required: false
+    description_zh: "MOF的有机配体名称，如2-甲基咪唑、BDC、BTC"
+    description_en: "Organic linker of MOF, e.g. 2-methylimidazole, BDC, BTC"
+
+  - key: Temperature
+    label_zh: 碳化温度
+    label_en: Carbonization Temperature
+    type: text
+    required: true
+    description_zh: "最高碳化温度，填数值和单位，如 900 °C。若做了温度系列研究填所有温度如 600/700/800/900 °C"
+    description_en: "Maximum carbonization temperature with unit, e.g. 900 °C. If temperature series, list all like 600/700/800/900 °C"
+
+  - key: Atmosphere
+    label_zh: 气氛
+    label_en: Atmosphere
+    type: text
+    required: true
+    description_zh: "碳化气氛，如 N2、Ar、H2/Ar、NH3、真空"
+    description_en: "Carbonization atmosphere, e.g. N2, Ar, H2/Ar, NH3, vacuum"
+
+  - key: Heating_Rate
+    label_zh: 升温速率
+    label_en: Heating Rate
+    type: text
+    required: false
+    description_zh: "升温速率，填数值和单位，如 5 °C/min"
+    description_en: "Heating rate with unit, e.g. 5 °C/min"
+
+  - key: Holding_Time
+    label_zh: 保温时间
+    label_en: Holding Time
+    type: text
+    required: false
+    description_zh: "在最高温度的保温时间，填数值和单位，如 2 h"
+    description_en: "Holding time at maximum temperature with unit, e.g. 2 h"
+
+  - key: Metal_Behavior_Type
+    label_zh: 金属行为类型
+    label_en: Metal Behavior Type
+    type: enum_multi
+    required: true
+    allow_custom: true
+    require_evidence: true
+    options_zh:
+      - 挥发型
+      - 还原型
+      - 催化石墨化型
+      - 迁移团聚型
+      - 单原子稳定型
+      - 碳化物形成型
+      - 合金化型
+      - 价态保持型
+    options_en:
+      - Volatilization
+      - Reduction
+      - Catalytic-Graphitization
+      - Migration-Aggregation
+      - Single-Atom-Stabilization
+      - Carbide-Formation
+      - Alloying
+      - Valence-Preservation
+    description_zh: |
+      金属在碳化过程中的行为类型。
+      输出格式为JSON数组，每项包含：
+      {
+        "value": "标签名",
+        "source": "predefined 或 ai_generated",
+        "evidence": "原文证据片段（≤80字）",
+        "confidence": "high/medium/low"
+      }
+    description_en: |
+      Type of metal behavior during carbonization.
+      Output as JSON array, each item contains:
+      {
+        "value": "tag name",
+        "source": "predefined or ai_generated",
+        "evidence": "original text evidence (≤80 chars)",
+        "confidence": "high/medium/low"
+      }
+
+  - key: Critical_Temp
+    label_zh: 关键转变温度
+    label_en: Critical Transition Temperature
+    type: text
+    required: false
+    description_zh: "金属发生关键相变或行为转变的温度节点，如 '907°C附近Zn开始大量挥发'"
+    description_en: "Temperature at which key phase transition or behavioral change occurs"
+
+  - key: Final_Metal_State
+    label_zh: 最终金属形态
+    label_en: Final Metal State
+    type: text
+    required: true
+    description_zh: "碳化后金属的最终存在形式，如 金属纳米颗粒、单原子、Fe3C碳化物、已完全挥发"
+    description_en: "Final form of metal after carbonization, e.g. metal nanoparticles, single atom, Fe3C carbide, fully evaporated"
+
+  - key: Carbon_Structure
+    label_zh: 碳结构
+    label_en: Carbon Structure
+    type: text
+    required: true
+    description_zh: "碳骨架的结构特征，如 无定形碳、部分石墨化、石墨碳壳、碳纳米管"
+    description_en: "Structural characteristics of carbon framework, e.g. amorphous, partially graphitized, graphitic carbon shell, CNT"
+
+  - key: Porosity
+    label_zh: 孔结构
+    label_en: Porosity
+    type: text
+    required: false
+    description_zh: "孔结构类型和关键数据，如 '微孔为主，BET比表面积 1200 m2/g，孔容 0.8 cm3/g'"
+    description_en: "Pore structure type and key data, e.g. 'micropore-dominant, BET 1200 m2/g, pore volume 0.8 cm3/g'"
+
+  - key: Characterization
+    label_zh: 表征手段
+    label_en: Characterization Methods
+    type: text
+    required: false
+    description_zh: "使用的主要表征技术列表，用逗号分隔，标注是否原位（in-situ）"
+    description_en: "List of main characterization techniques used, comma separated, note if in-situ"
+
+  - key: Performance
+    label_zh: 应用性能
+    label_en: Application Performance
+    type: text
+    required: false
+    description_zh: "最终材料的应用领域和关键性能数据，如 'ORR，E1/2=0.85V vs RHE'"
+    description_en: "Application field and key performance data, e.g. 'ORR, E1/2=0.85V vs RHE'"

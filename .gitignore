@@ -1,0 +1,34 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ─── PyInstaller / Inno Setup 打包产物 ───
+build/
+dist/
+installer_output/
+
+# ─── 本地配置（含 API Key，严禁上传）───
+config/
+
+# ─── 本地数据（文献数据库、缓存，可能涉及版权）───
+project/
+*.db
+
+# ─── 私有提示词（只发布通用版 v1.0_basic.yaml）───
+prompts/v2.0_*.yaml
+prompts/v3.*_*.yaml
+prompts/v4.*_*.yaml
+prompts/v5.*_*.yaml
+
+# ─── 临时文件 ───
+code_bundle.json
+
+# ─── IDE / 系统 ───
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
