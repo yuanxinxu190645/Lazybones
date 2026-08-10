@@ -11,13 +11,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 def _get_resource_base() -> Path:
     """只读资源根目录（prompts、Readme）：程序安装目录"""
     if getattr(sys, 'frozen', False):
-        return Path(sys.executable).parent
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     else:
         return Path(__file__).parent.parent
 
 
 def _get_writable_base() -> Path:
-    """可写数据根目录（config、project）：AppData\Roaming\Lazybones"""
+    r"""可写数据根目录（config、project）：AppData\Roaming\Lazybones"""
     if getattr(sys, 'frozen', False):
         appdata = Path(os.environ.get("APPDATA", Path.home()))
         writable = appdata / "Lazybones"
@@ -92,9 +92,28 @@ def check_project_structure():
             "model": "deepseek-chat",
             "api_key": "",
             "concurrent": 3,
+            "theme": "classic",
+            "font_scale": 100,
+            "ui_density": "comfortable",
+            "manage_page_size": 100,
+            "auto_update_check": True,
+            "performance_mode": "balanced",
+            "custom_cpu_workers": 2,
+            "custom_ai_workers": 3,
+            "custom_active_documents": 3,
+            "memory_limit_percent": 75,
+            "ocr_dpi": 190,
+            "gpu_mode": "auto",
+            "gpu_ocr_enabled": True,
             "max_chars": 80000,
             "lang_zh": True,
             "lang_en": True,
+            "auto_confirm_clean_pairs": True,
+            "auto_open_review": True,
+            "review_lang": "zh",
+            "review_schema_filter": "全部",
+            "last_import_dir": "",
+            "pending_files": [],
             "project_dir": str(writable_base / "project").replace("\\", "/"),
             "schema_version": "",
             "ai_timeout": 600,

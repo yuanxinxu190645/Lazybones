@@ -1,0 +1,40 @@
+name: Build portable release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Verify tag matches app version
+        shell: pwsh
+        run: |
+          $version = python -c "import sys; sys.path.insert(0, 'src'); from version import APP_VERSION; print(APP_VERSION)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match APP_VERSION $version"
+          }
+      - name: Build and test portable package
+        run: python scripts/build_portable.py
+      - name: Create GitHub Release and upload assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ github.ref_name }}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "${{ github.ref_name }}" --generate-notes --title "Lazybones ${{ github.ref_name }}"
+          }
+          gh release upload "${{ github.ref_name }}" release/*.zip release/*.sha256 release/SHA256SUMS.txt --clobber

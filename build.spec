@@ -1,34 +1,42 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller onedir build for the Lazybones portable release."""
+
 from PyInstaller.utils.hooks import collect_all
 
-# 收齐 openai 和 tkinterdnd2 的所有依赖
-openai_datas, openai_binaries, openai_hiddenimports = collect_all('openai')
-tk_datas, tk_binaries, tk_hiddenimports = collect_all('tkinterdnd2')
 
-# ★ 关键:不打包 prompts 文件夹!
-# 通用提示词 v1.0_basic.yaml 由 Inno Setup 装到 {app}\prompts\
-# 你的私有调试提示词留在源码目录,不会进 EXE
-# 同理:project / config 由程序运行时在 %APPDATA% 自动创建,这里不需要
 datas = [
-    ('Readme.yaml', '.'),
-    ('icon.ico', '.'),
+    ("prompts/v1.0_basic.yaml", "prompts"),
+    ("Readme.yaml", "."),
+    ("icon.ico", "."),
+    ("dist-tools/LazybonesUpdater.exe", "."),
+]
+binaries = []
+hiddenimports = [
+    "fitz",
+    "pdfplumber",
+    "docx",
+    "openpyxl",
+    "yaml",
+    "win32com.client",
+    "pythoncom",
+    "pywintypes",
 ]
 
+for package in ("openai", "tkinterdnd2", "rapidocr", "onnxruntime"):
+    package_datas, package_binaries, package_hidden = collect_all(package)
+    datas += package_datas
+    binaries += package_binaries
+    hiddenimports += package_hidden
+
 a = Analysis(
-    ['src/main.py'],
-    pathex=['src'],
-    binaries=openai_binaries + tk_binaries,
-    datas=datas + openai_datas + tk_datas,
-    hiddenimports=[
-        'fitz',
-        'pdfplumber',
-        'docx',
-        'openpyxl',
-        'yaml',
-    ] + openai_hiddenimports + tk_hiddenimports,
-    hookspath=[],
+    ["src/main.py"],
+    pathex=["src"],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=["hooks"],
     runtime_hooks=[],
-    excludes=[],
+    excludes=["pytest", "IPython", "notebook"],
     noarchive=False,
 )
 
@@ -37,15 +45,23 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    name='Lazybones',
+    exclude_binaries=True,
+    name="Lazybones",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,            # 先关掉,避免杀软误报
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
-    icon='icon.ico',      # ← 只写一次!
+    icon="icon.ico",
+    contents_directory="_internal",
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="Lazybones",
 )

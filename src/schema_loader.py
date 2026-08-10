@@ -116,7 +116,7 @@ _IDENTITY_KEYS = {f["key"] for f in _IDENTITY_FIELDS_ZH}
 def _get_resource_base() -> Path:
     """只读资源根目录（prompts）：程序安装目录"""
     if getattr(sys, 'frozen', False):
-        return Path(sys.executable).parent
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     else:
         return Path(__file__).parent.parent
 
@@ -323,4 +323,3 @@ def get_field_labels(schema: dict, lang: str = "zh") -> dict:
 # 对外公开别名,供 ui.py 在审核页渲染身份字段使用
 IDENTITY_FIELDS = _IDENTITY_FIELDS_ZH
 IDENTITY_KEYS = _IDENTITY_KEYS
-

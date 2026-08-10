@@ -9,6 +9,8 @@ import uuid
 import shutil
 import sqlite3
 import re
+import sys
+import webbrowser
 import tkinterdnd2 as TkinterDnD
 from pathlib import Path
 from datetime import datetime
@@ -16,17 +18,50 @@ from datetime import datetime
 from schema_loader import (load_settings, save_settings, list_prompt_versions,
                            load_schema, build_prompt, get_field_labels)
 from extractor import (match_si_files, generate_paper_id,
-                       process_to_text_cache, SI_PATTERN)
+                       process_to_text_cache, deduplicate_pairs,
+                       record_document_identity, document_requires_ocr,
+                       SI_PATTERN)
+from performance import (MODE_IDS_BY_LABEL, MODE_LABELS,
+                         PerformanceManager)
 from ai_client import PROVIDERS, test_connection, extract_paper, quick_ask
 from database import (init_db, get_db_path, get_db_path_by_name,
                       list_databases, create_database,
                       insert_paper, delete_paper, reject_paper,
                       get_all_papers, get_paper, update_paper_field,
-                      get_stats, export_zip, import_zip, export_citations,
+                      get_stats, export_zip, import_zip,
+                      inspect_backup,
+                      find_duplicate_groups, merge_duplicate_group,
                       init_chat_db, list_chat_sessions, save_chat_session,
                       save_chat_message, load_chat_messages,
                       delete_chat_session)
 from exporter import export_excel
+from search_index import (
+    build_paper_search_document as _build_paper_search_document,
+    build_cached_search_documents,
+    normalize_search_text as _normalize_search_text,
+)
+from citation_manager import (
+    AVAILABLE_FIELDS, DEFAULT_INLINE_ITEM_TEMPLATE,
+    DEFAULT_INLINE_TEMPLATE, DEFAULT_SCHEME, DEFAULT_TEMPLATE,
+    delete_citation_scheme, format_citation_list,
+    format_citation, format_inline_citation,
+    load_citation_schemes, normalize_citation_scheme,
+    save_citation_schemes,
+    select_citation_record, upsert_citation_scheme,
+)
+from citation_session import CitationSessionStore
+from office_bridge import OfficeBridge, OfficeBridgeError
+from workflow import (can_auto_continue_pairs, next_item_index,
+                      normalize_pending_files)
+from theme import (DENSITY_IDS_BY_LABEL, DENSITY_LABELS,
+                   THEME_IDS_BY_LABEL, THEME_LABELS, ThemeManager,
+                   normalize_appearance)
+from pagination import (DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS,
+                        normalize_page_size, paginate_rows)
+from update_manager import (UpdateError, check_latest_release,
+                            download_update, launch_portable_updater,
+                            updates_dir)
+from version import APP_VERSION, GITHUB_RELEASES_URL
 NL = chr(10)
 NL2 = chr(10) + chr(10)
 
@@ -37,9 +72,10 @@ class App(TkinterDnD.Tk):
         super().__init__()
         self.title("文献智能抽取工具")
         self.geometry("1280x820")
-        self.configure(bg="#F0F0F0")
 
         self.settings = load_settings()
+        self.theme_manager = ThemeManager(self, self.settings)
+        self.performance_manager = PerformanceManager(self.settings)
         self._ensure_project_dirs()
         self._init_db()
 
@@ -47,10 +83,27 @@ class App(TkinterDnD.Tk):
         self._review_items = []
         self._stop_flag = False
         self._all_papers_cache = []
+        self._manage_papers_by_id = {}
+        self._manage_search_index = {}
+        self._manage_base_search_index = {}
+        self._manage_filtered_rows = []
+        self._manage_selected_ids = set()
+        self._manage_page = 1
+        self._manage_page_size = normalize_page_size(
+            self.settings.get("manage_page_size", DEFAULT_PAGE_SIZE))
+        self._manage_selection_sync = False
+        self._filter_after_id = None
         self._chat_messages = []
         self._find_replace_history = []
+        self._pending_theme_roots = {}
+        self._theme_flush_after_id = None
 
         self._build_ui()
+        self.theme_manager.apply(self.settings)
+        self.bind_all("<Map>", self._on_theme_widget_map, add="+")
+        self.after(2500, self._poll_system_theme)
+        self._restore_pending_queue()
+        self.after(5000, self._auto_check_for_updates)
 
     def _ensure_project_dirs(self):
         base = Path(self.settings.get("project_dir", ""))
@@ -67,8 +120,7 @@ class App(TkinterDnD.Tk):
         init_db(self.db_path)
 
     # ── AI 按钮工厂 ────────────────────────────────────
-    @staticmethod
-    def _ai_button(parent, text, command, **kwargs):
+    def _ai_button(self, parent, text, command, **kwargs):
         """创建带茶绿色标识的 AI 功能按钮"""
         btn = tk.Button(
             parent,
@@ -85,7 +137,43 @@ class App(TkinterDnD.Tk):
             cursor="hand2",
             **kwargs
         )
+        btn._theme_role = "accent"
         return btn
+
+    def _on_theme_widget_map(self, event):
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            return
+        if self.theme_manager.widget_is_current(widget):
+            return
+        try:
+            target = widget.winfo_toplevel()
+            key = str(target)
+        except tk.TclError:
+            return
+        # A page can map dozens of children in one event cycle.  Queue its
+        # top-level once instead of repainting every child one after another.
+        self._pending_theme_roots[key] = target
+        if self._theme_flush_after_id is None:
+            self._theme_flush_after_id = self.after_idle(
+                self._flush_mapped_theme_widgets)
+
+    def _flush_mapped_theme_widgets(self):
+        self._theme_flush_after_id = None
+        pending = list(self._pending_theme_roots.values())
+        self._pending_theme_roots.clear()
+        for target in pending:
+            try:
+                if target.winfo_exists():
+                    self.theme_manager.apply_tree(target)
+            except tk.TclError:
+                continue
+
+    def _poll_system_theme(self):
+        try:
+            self.theme_manager.poll_system_change(self.settings)
+        finally:
+            self.after(2500, self._poll_system_theme)
 
     def _build_ui(self):
         self.notebook = ttk.Notebook(self)
@@ -110,6 +198,7 @@ class App(TkinterDnD.Tk):
         status_bar = tk.Label(self, textvariable=self.status_var,
                               bd=1, relief=tk.SUNKEN, anchor=tk.W,
                               bg="#E0E0E0", padx=8)
+        status_bar._theme_role = "status"
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
     # ════════════════════════════════════════════════════
@@ -127,6 +216,7 @@ class App(TkinterDnD.Tk):
             text="拖放文件到此窗口或点击下方按钮选择",
             fg="#0070C0", font=("微软雅黑", 9, "bold"),
             justify=tk.LEFT)
+        self.tip_label._theme_role = "accent"
         self.tip_label.pack(pady=4)
 
         btn_frame = ttk.Frame(left)
@@ -174,9 +264,32 @@ class App(TkinterDnD.Tk):
         self.lang_en_var = tk.BooleanVar(
             value=self.settings.get("lang_en", True))
         ttk.Checkbutton(row2, text="抽取中文版",
-                        variable=self.lang_zh_var).pack(side=tk.LEFT)
+                        variable=self.lang_zh_var,
+                        command=self._persist_workflow_options
+                        ).pack(side=tk.LEFT)
         ttk.Checkbutton(row2, text="抽取英文版",
-                        variable=self.lang_en_var).pack(side=tk.LEFT, padx=20)
+                        variable=self.lang_en_var,
+                        command=self._persist_workflow_options
+                        ).pack(side=tk.LEFT, padx=20)
+
+        row3 = ttk.Frame(ctrl)
+        row3.pack(fill=tk.X, pady=3)
+        self.auto_confirm_pairs_var = tk.BooleanVar(value=self.settings.get(
+            "auto_confirm_clean_pairs", True))
+        self.auto_open_review_var = tk.BooleanVar(value=self.settings.get(
+            "auto_open_review", True))
+        ttk.Checkbutton(
+            row3, text="配对无异常时自动继续",
+            variable=self.auto_confirm_pairs_var,
+            command=self._persist_workflow_options).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            row3, text="完成后自动进入审核",
+            variable=self.auto_open_review_var,
+            command=self._persist_workflow_options).pack(
+                side=tk.LEFT, padx=20)
+        ttk.Label(row3, text="（孤立 SI 仍会要求确认）",
+                  foreground="#777").pack(side=tk.LEFT)
+
         btn_row = ttk.Frame(ctrl)
         btn_row.pack(pady=6)
         self.start_btn = self._ai_button(
@@ -198,6 +311,7 @@ class App(TkinterDnD.Tk):
         self.log_text = scrolledtext.ScrolledText(
             log_frame, height=22, state=tk.DISABLED,
             font=("Consolas", 9), bg="#1E1E1E", fg="#D4D4D4")
+        self.log_text._theme_role = "log"
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         self.log_text.tag_config("time",   foreground="#6A9955")
@@ -260,11 +374,41 @@ class App(TkinterDnD.Tk):
         self.update_idletasks()
 
     def _select_files(self):
+        initial_dir = self.settings.get("last_import_dir", "")
+        if not Path(initial_dir).is_dir():
+            initial_dir = self.settings.get("project_dir", "")
         files = filedialog.askopenfilenames(
             title="选择论文文件",
+            initialdir=initial_dir or None,
             filetypes=[("文档", "*.pdf *.docx *.doc"), ("所有文件", "*.*")])
         if files:
+            self.settings["last_import_dir"] = str(Path(files[0]).parent)
+            save_settings(self.settings)
             self._add_to_queue(list(files))
+
+    def _persist_workflow_options(self):
+        self.settings.update({
+            "lang_zh": bool(self.lang_zh_var.get()),
+            "lang_en": bool(self.lang_en_var.get()),
+            "auto_confirm_clean_pairs": bool(
+                self.auto_confirm_pairs_var.get()),
+            "auto_open_review": bool(self.auto_open_review_var.get()),
+        })
+        save_settings(self.settings)
+
+    def _persist_pending_queue(self):
+        self.settings["pending_files"] = list(self._queue_files)
+        save_settings(self.settings)
+
+    def _restore_pending_queue(self):
+        pending = self.settings.get("pending_files", [])
+        if not isinstance(pending, list):
+            pending = []
+        restored = self._add_to_queue(pending, persist=False)
+        # Remove stale paths from the persisted state at startup.
+        self._persist_pending_queue()
+        if restored:
+            self._log("已恢复上次未完成队列 " + str(restored) + " 个文件")
 
     def _scan_inbox(self):
         inbox = Path(self.settings.get("project_dir", "")) / "inbox"
@@ -280,22 +424,27 @@ class App(TkinterDnD.Tk):
         self._add_to_queue([str(f) for f in files])
         self._log("从inbox扫描到 " + str(len(files)) + " 个文件")
 
-    def _add_to_queue(self, files: list):
-        for f in files:
-            if f not in self._queue_files:
-                self._queue_files.append(f)
-                self.queue_listbox.insert(tk.END, Path(f).name)
+    def _add_to_queue(self, files: list, persist: bool = True):
+        additions = normalize_pending_files(files, self._queue_files)
+        for path in additions:
+            self._queue_files.append(path)
+            self.queue_listbox.insert(tk.END, Path(path).name)
+        if persist:
+            self._persist_pending_queue()
         self.status_var.set("队列中 " + str(len(self._queue_files)) + " 个文件")
+        return len(additions)
 
     def _remove_from_queue(self):
         for idx in reversed(self.queue_listbox.curselection()):
             self.queue_listbox.delete(idx)
             self._queue_files.pop(idx)
+        self._persist_pending_queue()
         self.status_var.set("队列中 " + str(len(self._queue_files)) + " 个文件")
 
     def _clear_queue(self):
         self._queue_files.clear()
         self.queue_listbox.delete(0, tk.END)
+        self._persist_pending_queue()
         self.status_var.set("就绪")
 
     def _stop_extraction(self):
@@ -313,6 +462,8 @@ class App(TkinterDnD.Tk):
                 for ext in ("*.pdf", "*.docx", "*.doc"):
                     valid.extend(str(x) for x in p.rglob(ext))
         if valid:
+            self.settings["last_import_dir"] = str(Path(valid[0]).parent)
+            save_settings(self.settings)
             self._add_to_queue(valid)
             self._log("拖入 " + str(len(valid)) + " 个文件")
 
@@ -340,18 +491,19 @@ class App(TkinterDnD.Tk):
 
     def _remove_done_file(self, file_path: str):
         """按文件名找 listbox 索引,避免异步删除时索引错位"""
-        if file_path not in self._queue_files:
-            return
         target_name = Path(file_path).name
-        self._queue_files.remove(file_path)
 
         def _do_delete():
+            if file_path not in self._queue_files:
+                return
+            self._queue_files.remove(file_path)
             for i in range(self.queue_listbox.size()):
                 if self.queue_listbox.get(i) == target_name:
                     self.queue_listbox.delete(i)
                     break
             self.status_var.set(
                 "队列中 " + str(len(self._queue_files)) + " 个文件")
+            self._persist_pending_queue()
 
         self.after(0, _do_delete)
 
@@ -391,7 +543,7 @@ class App(TkinterDnD.Tk):
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
         except Exception:
             # meta.json 损坏,直接当失效
-            self._log("   ⚠ meta.json 损坏,缓存判定失效:" + paper_id)
+            self._safe_log("   ⚠ meta.json 损坏,缓存判定失效:" + paper_id)
             shutil.rmtree(cache_dir, ignore_errors=True)
             return False
 
@@ -399,12 +551,32 @@ class App(TkinterDnD.Tk):
         current_si = sorted([Path(p).name for p in current_si_paths])
 
         if cached_si == current_si:
+            # Older releases cached the "OCR unavailable/failed" message as
+            # if it were paper text.  Now that OCR is bundled, rebuild those
+            # caches once instead of sending the error marker to the AI.
+            cached_text_files = [cache_dir / "main.txt"]
+            cached_text_files.extend(sorted(cache_dir.glob("SI_*.txt")))
+            for text_file in cached_text_files:
+                try:
+                    sample = text_file.read_text(
+                        encoding="utf-8", errors="ignore")[:500]
+                except OSError:
+                    continue
+                if ("[OCR 不可用" in sample or
+                        "[OCR 处理失败" in sample):
+                    self._safe_log(
+                        "   ⚠ 发现旧版 OCR 失败缓存，自动重建:" + paper_id)
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                    return False
             return True
 
         # SI 列表不一致 → 缓存失效,清理 text_cache 和对应的 extract_cache
-        self._log("   ⚠ 检测到 SI 配对变化,旧缓存失效,自动重建:" + paper_id)
-        self._log("      旧 SI: " + (str(cached_si) if cached_si else "[]"))
-        self._log("      新 SI: " + (str(current_si) if current_si else "[]"))
+        self._safe_log(
+            "   ⚠ 检测到 SI 配对变化,旧缓存失效,自动重建:" + paper_id)
+        self._safe_log(
+            "      旧 SI: " + (str(cached_si) if cached_si else "[]"))
+        self._safe_log(
+            "      新 SI: " + (str(current_si) if current_si else "[]"))
 
         shutil.rmtree(cache_dir, ignore_errors=True)
 
@@ -413,7 +585,7 @@ class App(TkinterDnD.Tk):
             for cf in extract_dir.glob(schema_ver + "_*.json"):
                 try:
                     cf.unlink()
-                    self._log("      已删除旧 AI 缓存: " + cf.name)
+                    self._safe_log("      已删除旧 AI 缓存: " + cf.name)
                 except Exception:
                     pass
 
@@ -422,30 +594,89 @@ class App(TkinterDnD.Tk):
     def _run_extraction(self):
         files = self._queue_files.copy()
         
-        self._log("========= 开始分析文件类型 =========")
+        self._safe_log("========= 开始分析文件类型 =========")
         raw_pairs, orphan_sis = match_si_files(files, log_fn=self._safe_log)
 
-        result_holder = {"value": None}
-        confirm_event = threading.Event()
-        self.after(0, lambda: self._confirm_pairs(
-            raw_pairs, orphan_sis, result_holder, confirm_event))
-        confirm_event.wait()
+        if can_auto_continue_pairs(
+                raw_pairs, orphan_sis,
+                self.settings.get("auto_confirm_clean_pairs", True)):
+            pairs = raw_pairs
+            self._safe_log(
+                "✓ 正文/SI 配对无异常，已按设置自动继续（共 " +
+                str(len(pairs)) + " 篇）")
+        else:
+            result_holder = {"value": None}
+            confirm_event = threading.Event()
+            self.after(0, lambda: self._confirm_pairs(
+                raw_pairs, orphan_sis, result_holder, confirm_event))
+            confirm_event.wait()
 
-        if result_holder["value"] is False:
-            self._log("已取消")
-            self.start_btn.configure(state=tk.NORMAL)
-            self.stop_btn.configure(state=tk.DISABLED)
+            if result_holder["value"] is False:
+                self._safe_log("已取消")
+                self.after(0, lambda: (
+                    self.start_btn.configure(state=tk.NORMAL),
+                    self.stop_btn.configure(state=tk.DISABLED)))
+                return
+            pairs = result_holder["value"]
+
+        project_dir = self.settings.get("project_dir", "")
+        pairs, duplicates, identities = deduplicate_pairs(
+            pairs, project_dir, log_fn=self._safe_log,
+            current_db_path=self.db_path,
+            current_db_name=(self.db_name_var.get()
+                             if hasattr(self, "db_name_var")
+                             else self.settings.get("current_db", "main")))
+
+        for duplicate in duplicates:
+            for path in ([duplicate["main_path"]] +
+                         list(duplicate["si_paths"])):
+                self._remove_done_file(path)
+
+        si_updates = sum(
+            1 for identity in identities.values()
+            if identity.get("_dedup_state") == "si_changed")
+        if pairs and (duplicates or si_updates):
+            library_hits = sum(
+                1 for duplicate in duplicates
+                if duplicate.get("current_library"))
+            history_hits = len(duplicates) - library_hits
+            summary = (
+                "已在 AI 调用前截停 " + str(len(duplicates)) + " 篇重复文献。"
+                + chr(10) +
+                "当前文献库命中：" + str(library_hits) + " 篇"
+                + chr(10) +
+                "历史处理记录命中：" + str(history_hits) + " 篇"
+                + chr(10) +
+                "正文相同但 SI 更新：" + str(si_updates) +
+                " 篇（将重新抽取并更新稳定文献 ID）"
+                + chr(10) + chr(10) +
+                "详细命中条目和判重依据已写入抽取日志。")
+            self.after(0, lambda text=summary: messagebox.showinfo(
+                "导入去重", text))
+
+        if not pairs:
+            self._safe_log("所有配对均为已处理文献，本次未调用 AI。")
+            self.after(0, lambda: (
+                self.start_btn.configure(state=tk.NORMAL),
+                self.stop_btn.configure(state=tk.DISABLED)))
+            self.after(0, lambda: messagebox.showinfo(
+                "去重完成",
+                "本次文献均已处理，已在正文/SI 匹配阶段剔除。\n"
+                "没有调用 AI，也不会产生重复费用。"))
             return
-        pairs = result_holder["value"]
 
         total = len(pairs)
-        concurrent = max(1, int(self.settings.get("concurrent", 3)))
-        self._log("========= 开始处理 " + str(total) +
-                  " 篇文献(并发 " + str(concurrent) + ") =========")
+        # Refresh free memory at the start of each batch so balanced/high mode
+        # automatically scales down when the computer is already busy.
+        budget = self.performance_manager.refresh(
+            self.settings, redetect=True)
+        concurrent = budget.ai_workers
+        self._safe_log("[性能] " + self.performance_manager.budget_summary())
+        self._safe_log("========= 开始处理 " + str(total) +
+                       " 篇文献(并发 " + str(concurrent) + ") =========")
 
         schema_ver = self.schema_var.get()
         schema = load_schema(schema_ver)
-        project_dir = self.settings.get("project_dir", "")
         text_cache_dir = str(Path(project_dir) / "text_cache")
         extract_cache_dir = str(Path(project_dir) / "extract_cache")
 
@@ -455,35 +686,88 @@ class App(TkinterDnD.Tk):
         if self.lang_en_var.get():
             langs.append("en")
 
-        # Step 1: 顺序提取文本缓存(避免 PDF 库多线程问题)
+        # Step 1: CPU 密集型转换使用独立进程；OCR 使用单独的单进程池，
+        # 避免多个模型副本同时占用显存。
+        import concurrent.futures as cf
+
         prepared = []
+        conversion_work = []
+        performance_options = budget.to_dict()
         for i, (main_path, si_paths) in enumerate(pairs.items()):
             if self._stop_flag:
                 break
-            paper_id = generate_paper_id(main_path)
-            self._log("[文本] [" + str(i + 1) + "/" + str(total) +
-                      "] " + paper_id)
+            identity = identities.get(main_path) or {}
+            paper_id = generate_paper_id(
+                main_path, doi=identity.get("doi"), identity=identity)
+            self._safe_log("[文本] [" + str(i + 1) + "/" + str(total) +
+                           "] " + paper_id)
             try:
-                # 关键改动:先校验缓存与当前 SI 配对是否一致
                 cache_valid = self._validate_text_cache(
                     paper_id, si_paths,
                     text_cache_dir, extract_cache_dir, schema_ver)
-
                 if cache_valid:
-                    self._log("   ✓ 文本缓存命中")
+                    self._safe_log("   ✓ 文本缓存命中")
+                    prepared.append(
+                        (paper_id, main_path, list(si_paths), identity))
                 else:
-                    self._log("   → 提取文本...")
-                    process_to_text_cache(
-                        main_path, si_paths, text_cache_dir, paper_id,
-                        self.settings.get("max_chars", 80000))
-                    self._log("   ✓ 文本提取完成")
-                prepared.append((paper_id, main_path, list(si_paths)))
-            except Exception as e:
-                self._log("   ✗ 文本提取失败:" + type(e).__name__ +
-                          ": " + str(e)[:200])
+                    needs_ocr = document_requires_ocr(
+                        [main_path] + list(si_paths))
+                    conversion_work.append((
+                        paper_id, main_path, list(si_paths), identity,
+                        needs_ocr))
+            except Exception as exc:
+                self._safe_log(
+                    "   ✗ 文本预处理失败:" + type(exc).__name__ +
+                    ": " + str(exc)[:200])
 
-        # Step 2: 并发调用 AI
-        import concurrent.futures as cf
+        if conversion_work and not self._stop_flag:
+            has_ocr = any(item[4] for item in conversion_work)
+            normal_workers = min(
+                budget.cpu_workers,
+                max(1, budget.active_documents - (1 if has_ocr else 0)))
+            self._safe_log(
+                "[性能] 文本转换进程 " + str(normal_workers) +
+                ("，OCR 专用进程 1" if has_ocr else ""))
+            normal_pool = cf.ProcessPoolExecutor(max_workers=normal_workers)
+            ocr_pool = (cf.ProcessPoolExecutor(max_workers=1)
+                        if has_ocr else None)
+            futures = {}
+            try:
+                for item in conversion_work:
+                    paper_id, main_path, si_paths, identity, needs_ocr = item
+                    pool = ocr_pool if needs_ocr else normal_pool
+                    future = pool.submit(
+                        process_to_text_cache,
+                        main_path, si_paths, text_cache_dir, paper_id,
+                        self.settings.get("max_chars", 80000), identity,
+                        performance_options)
+                    futures[future] = item
+
+                for future in cf.as_completed(futures):
+                    item = futures[future]
+                    paper_id, main_path, si_paths, identity, needs_ocr = item
+                    if self._stop_flag:
+                        for pending in futures:
+                            pending.cancel()
+                        break
+                    try:
+                        future.result()
+                        prepared.append(
+                            (paper_id, main_path, si_paths, identity))
+                        provider = "OCR" if needs_ocr else "CPU"
+                        self._safe_log(
+                            "   ✓ 文本提取完成 [" + provider + "] " +
+                            paper_id)
+                    except Exception as exc:
+                        self._safe_log(
+                            "   ✗ 文本提取失败(" + paper_id + "): " +
+                            type(exc).__name__ + ": " + str(exc)[:200])
+            finally:
+                normal_pool.shutdown(wait=True, cancel_futures=True)
+                if ocr_pool is not None:
+                    ocr_pool.shutdown(wait=True, cancel_futures=True)
+
+        # Step 2: 网络型 AI 调用使用线程池，并发数由性能模式统一控制
 
         success_counter = {"n": 0}
         failed_counter = {"n": 0}
@@ -492,7 +776,7 @@ class App(TkinterDnD.Tk):
         start_ts = time.time()
 
         def process_one(item):
-            paper_id, main_path, si_paths = item
+            paper_id, main_path, si_paths, identity = item
             if self._stop_flag:
                 return ("stopped", paper_id)
 
@@ -545,6 +829,10 @@ class App(TkinterDnD.Tk):
                         "),tokens=" +
                         str(result.get("_tokens_used", 0)))
 
+                # 仅在所有目标语言均已成功或命中 AI 缓存后登记去重身份。
+                # 失败的任务不登记，用户下次拖入时仍可正常重试。
+                record_document_identity(
+                    project_dir, paper_id, main_path, identity)
                 for sp in [main_path] + list(si_paths):
                     self._remove_done_file(sp)
                 return ("ok", paper_id)
@@ -577,17 +865,39 @@ class App(TkinterDnD.Tk):
                            e=eta_str: self.status_var.set(
                                f"已完成 {d}/{t} · 预计剩余 {e}"))
 
-        self._log("========= 完成:成功 " + str(success_counter["n"]) +
-                  ",失败 " + str(failed_counter["n"]) + " =========")
-        self.start_btn.configure(state=tk.NORMAL)
-        self.stop_btn.configure(state=tk.DISABLED)
-        self._refresh_review_tab()
-        messagebox.showinfo(
-            "完成",
-            "抽取结束" + chr(10) +
-            "成功 " + str(success_counter["n"]) +
-            ",失败 " + str(failed_counter["n"]) +
-            chr(10) + "请前往【审核】页面")
+        self._safe_log(
+            "========= 完成:成功 " + str(success_counter["n"]) +
+            ",失败 " + str(failed_counter["n"]) + " =========")
+        success_count = success_counter["n"]
+        failed_count = failed_counter["n"]
+
+        def finish_ui():
+            self.start_btn.configure(state=tk.NORMAL)
+            self.stop_btn.configure(state=tk.DISABLED)
+            if langs and self.review_lang_var.get() not in langs:
+                # Setting the variable triggers a persisted review refresh.
+                self.review_lang_var.set(langs[0])
+            else:
+                self._refresh_review_tab()
+            if (self.settings.get("auto_open_review", True)
+                    and success_count > 0):
+                self.notebook.select(self.tab_review)
+                self.review_status_label._theme_role = "success"
+                self.theme_manager.apply_widget(self.review_status_label)
+                self.review_status_var.set(
+                    "✓ 抽取完成：成功 " + str(success_count) +
+                    "，失败 " + str(failed_count) +
+                    "；已自动打开待审核首篇")
+                self.after(5000, lambda: self.review_status_var.set(""))
+            else:
+                messagebox.showinfo(
+                    "完成",
+                    "抽取结束" + chr(10) +
+                    "成功 " + str(success_count) +
+                    ",失败 " + str(failed_count) +
+                    chr(10) + "请前往【审核】页面")
+
+        self.after(0, finish_ui)
 
     def _do_rerun_one(self, paper_id: str, schema_ver: str, lang: str):
         """
@@ -963,7 +1273,8 @@ class App(TkinterDnD.Tk):
             win.destroy()
 
         ttk.Button(bottom, text="✓ 确认，开始抽取",
-                   command=on_confirm).pack(side=tk.LEFT, padx=8)
+                   command=on_confirm,
+                   style="Accent.TButton").pack(side=tk.LEFT, padx=8)
         ttk.Button(bottom, text="✗ 取消",
                    command=on_cancel).pack(side=tk.LEFT, padx=8)
         win.protocol("WM_DELETE_WINDOW", on_cancel)
@@ -980,21 +1291,25 @@ class App(TkinterDnD.Tk):
         ttk.Button(top, text="🔄 刷新",
                    command=self._refresh_review_tab).pack(side=tk.LEFT, padx=4)
         ttk.Label(top, text="语言:").pack(side=tk.LEFT, padx=(12, 2))
-        self.review_lang_var = tk.StringVar(value="zh")
+        saved_review_lang = self.settings.get("review_lang", "zh")
+        if saved_review_lang not in ("zh", "en"):
+            saved_review_lang = "zh"
+        self.review_lang_var = tk.StringVar(value=saved_review_lang)
         ttk.Combobox(top, textvariable=self.review_lang_var,
                      values=["zh", "en"], width=6,
                      state="readonly").pack(side=tk.LEFT)
         ttk.Label(top, text="版本:").pack(side=tk.LEFT, padx=(12, 2))
-        self.review_schema_var = tk.StringVar(value="全部")
+        self.review_schema_var = tk.StringVar(value=self.settings.get(
+            "review_schema_filter", "全部"))
         self.review_schema_combo = ttk.Combobox(
             top, textvariable=self.review_schema_var,
             width=22, state="readonly")
         self.review_schema_combo.pack(side=tk.LEFT)
         self.review_schema_combo.bind(
             "<<ComboboxSelected>>",
-            lambda e: self._refresh_review_tab())
+            self._on_review_filter_change)
         self.review_lang_var.trace_add(
-            "write", lambda *a: self._refresh_review_tab())
+            "write", lambda *args: self._on_review_filter_change())
 
         # ── 勾选操作快捷按钮 ──
         ttk.Separator(top, orient=tk.VERTICAL).pack(
@@ -1012,10 +1327,13 @@ class App(TkinterDnD.Tk):
 
         paned = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        self.review_paned = paned
+        self._review_split_initialized = False
+        paned.bind("<Map>", self._initialize_review_split, add="+")
 
         # ── 左侧:Treeview 替代 Listbox,首列做勾选框 ──
         left_frame = ttk.LabelFrame(paned, text="待审核(点击首列勾选)")
-        paned.add(left_frame, weight=1)
+        paned.add(left_frame, weight=2)
 
         cols = ("check", "paper_id", "ver_lang")
         self.review_tree = ttk.Treeview(
@@ -1024,10 +1342,14 @@ class App(TkinterDnD.Tk):
         self.review_tree.heading("check", text="✓")
         self.review_tree.heading("paper_id", text="文献ID")
         self.review_tree.heading("ver_lang", text="版本/语言")
-        self.review_tree.column("check", width=36, anchor=tk.CENTER,
+        self.review_tree.column("check", width=40, minwidth=40,
+                                anchor=tk.CENTER,
                                 stretch=False)
-        self.review_tree.column("paper_id", width=240)
-        self.review_tree.column("ver_lang", width=120, anchor=tk.CENTER)
+        # ID 吸收宽度变化；版本/语言保持完整可见，避免默认打开时被裁切。
+        self.review_tree.column("paper_id", width=205, minwidth=120,
+                                stretch=True)
+        self.review_tree.column("ver_lang", width=132, minwidth=118,
+                                anchor=tk.CENTER, stretch=False)
         self.review_tree.tag_configure("checked", background="#E8F5E9")
 
         rv_sb = ttk.Scrollbar(left_frame, orient=tk.VERTICAL,
@@ -1045,7 +1367,7 @@ class App(TkinterDnD.Tk):
         self._review_checked = {}
 
         right_frame = ttk.Frame(paned)
-        paned.add(right_frame, weight=3)
+        paned.add(right_frame, weight=5)
         self.review_detail = scrolledtext.ScrolledText(
             right_frame, font=("微软雅黑", 9), wrap=tk.WORD)
         self.review_detail.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -1067,11 +1389,30 @@ class App(TkinterDnD.Tk):
         self.review_detail.tag_config("evidence", foreground="#666",
                                       font=("微软雅黑", 8, "italic"))
         self.review_detail.tag_config("na", foreground="#999")
+        self.review_detail.tag_config(
+            "doi_link", foreground="#0066CC",
+            underline=True, font=("微软雅黑", 9, "bold"))
+        self.review_detail.tag_bind(
+            "doi_link", "<Enter>",
+            lambda event: self.review_detail.configure(cursor="hand2"))
+        self.review_detail.tag_bind(
+            "doi_link", "<Leave>",
+            lambda event: self.review_detail.configure(cursor="xterm"))
+        self.review_detail.bind("<Key>", self._readonly_text_key)
+        self._install_readonly_copy_support(self.review_detail)
+        self.review_detail.bind(
+            "<Control-Return>", self._review_accept_shortcut)
+        self.review_tree.bind(
+            "<Control-Return>", self._review_accept_shortcut)
+        self._review_current_doi = ""
 
         btn_frame = ttk.Frame(right_frame)
         btn_frame.pack(fill=tk.X, padx=4, pady=4)
         ttk.Button(btn_frame, text="✓ 收录入库(当前)",
                    command=self._accept_paper).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="✓ 收录并下一篇",
+                   command=self._accept_and_next,
+                   style="Accent.TButton").pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="✗ 丢弃(当前)",
                    command=self._reject_paper).pack(side=tk.LEFT, padx=4)
         ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(
@@ -1091,10 +1432,53 @@ class App(TkinterDnD.Tk):
         self.review_status_label = tk.Label(
             btn_frame, textvariable=self.review_status_var,
             fg="#0070C0", font=("微软雅黑", 9, "bold"))
+        self.review_status_label._theme_role = "accent"
         self.review_status_label.pack(side=tk.LEFT, padx=12)
 
         ttk.Button(btn_frame, text="📂 打开缓存目录",
                    command=self._open_cache_dir).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text="📋 复制 DOI",
+                   command=self._copy_review_doi).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btn_frame, text="下一篇 ▶",
+                   command=lambda: self._move_review_selection(1)
+                   ).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(btn_frame, text="◀ 上一篇",
+                   command=lambda: self._move_review_selection(-1)
+                   ).pack(side=tk.RIGHT, padx=2)
+
+        self.bind("<Control-Return>", self._review_accept_shortcut, add="+")
+        self.bind("<Alt-Left>",
+                  lambda event: self._review_navigation_shortcut(-1), add="+")
+        self.bind("<Alt-Right>",
+                  lambda event: self._review_navigation_shortcut(1), add="+")
+
+    def _initialize_review_split(self, event=None):
+        """Give the review list a useful width the first time it is shown."""
+        if self._review_split_initialized:
+            return
+        self.after_idle(self._apply_initial_review_split)
+
+    def _apply_initial_review_split(self):
+        if self._review_split_initialized:
+            return
+        try:
+            width = self.review_paned.winfo_width()
+            if width <= 100:
+                self.after(50, self._apply_initial_review_split)
+                return
+            # Roughly one third of the page, with enough room for all 3 columns.
+            target = max(390, round(width * 0.32))
+            target = min(target, max(300, width - 560))
+            self.review_paned.sashpos(0, target)
+            self._review_split_initialized = True
+        except tk.TclError:
+            pass
+
+    def _on_review_filter_change(self, event=None):
+        self.settings["review_lang"] = self.review_lang_var.get()
+        self.settings["review_schema_filter"] = self.review_schema_var.get()
+        save_settings(self.settings)
+        self._refresh_review_tab()
 
     def _refresh_review_tab(self):
         project_dir = self.settings.get("project_dir", "")
@@ -1102,6 +1486,8 @@ class App(TkinterDnD.Tk):
 
         versions = ["全部"] + list_prompt_versions()
         self.review_schema_combo["values"] = versions
+        if self.review_schema_var.get() not in versions:
+            self.review_schema_var.set("全部")
 
         # 清空 tree 和勾选状态
         for item in self.review_tree.get_children():
@@ -1150,6 +1536,19 @@ class App(TkinterDnD.Tk):
 
         self.status_var.set("待审核 " + str(len(self._review_items)) + " 条")
         self._update_review_check_count()
+        children = self.review_tree.get_children()
+        if children:
+            first = children[0]
+            self.review_tree.selection_set(first)
+            self.review_tree.focus(first)
+            self.review_tree.see(first)
+            self._on_review_tree_select()
+        elif hasattr(self, "review_detail"):
+            self.review_detail.configure(state=tk.NORMAL)
+            self.review_detail.delete("1.0", tk.END)
+            self.review_detail.insert(
+                tk.END, "当前筛选条件下没有待审核文献。")
+            self.review_detail.configure(state=tk.DISABLED)
 
     def _on_review_tree_click(self, event):
         """单击 tree:点首列时切换勾选,点其它列只走 select 逻辑"""
@@ -1193,6 +1592,43 @@ class App(TkinterDnD.Tk):
         n = sum(1 for v in self._review_checked.values() if v)
         if hasattr(self, "review_check_count_var"):
             self.review_check_count_var.set("已勾 " + str(n) + " 条")
+
+    def _select_review_index(self, index: int):
+        children = list(self.review_tree.get_children())
+        if not children:
+            return False
+        index = max(0, min(len(children) - 1, int(index)))
+        target = children[index]
+        self.review_tree.selection_set(target)
+        self.review_tree.focus(target)
+        self.review_tree.see(target)
+        self._on_review_tree_select()
+        return True
+
+    def _move_review_selection(self, delta: int):
+        children = list(self.review_tree.get_children())
+        if not children:
+            return
+        selection = self.review_tree.selection()
+        current = (children.index(selection[0])
+                   if selection and selection[0] in children else 0)
+        self._select_review_index(current + delta)
+
+    def _review_tab_is_active(self):
+        try:
+            return self.notebook.select() == str(self.tab_review)
+        except tk.TclError:
+            return False
+
+    def _review_accept_shortcut(self, event=None):
+        if self._review_tab_is_active():
+            self._accept_and_next()
+            return "break"
+
+    def _review_navigation_shortcut(self, delta: int):
+        if self._review_tab_is_active():
+            self._move_review_selection(delta)
+            return "break"
 
     def _on_review_tree_select(self, event=None):
         """选中行(非勾选)时刷新右侧详情"""
@@ -1305,6 +1741,10 @@ class App(TkinterDnD.Tk):
         from schema_loader import IDENTITY_KEYS as _IDENTITY_KEYS
 
         d = self.review_detail
+        self._review_current_doi = ""
+        d._identity_copy_values = {}
+        d._identity_copy_all_text = ""
+        d._identity_doi = ""
         d.configure(state=tk.NORMAL)
         d.delete("1.0", tk.END)
         d.insert(tk.END, "📄 " + item["paper_id"] + chr(10), "title")
@@ -1317,7 +1757,11 @@ class App(TkinterDnD.Tk):
 
         # ── 文献身份信息区块(硬编码字段)──
         d.insert(tk.END, "═══ 文献身份信息 ═══" + chr(10), "section")
+        d.insert(tk.END,
+                 "单击字段值复制；按住鼠标拖动可任意选择文字。" +
+                 chr(10), "evidence")
         label_key = "label_" + item["lang"]
+        identity_lines = ["文献ID: " + item["paper_id"]]
         for f in _IDENTITY_FIELDS_ZH:
             key = f["key"]
             label = f.get(label_key, key)
@@ -1332,9 +1776,21 @@ class App(TkinterDnD.Tk):
                 val = "; ".join(p for p in parts if p) or "N/A"
             else:
                 val = str(val) if val not in (None, "") else "N/A"
-            d.insert(tk.END, "  ▸ " + label + ": ", "identity_label")
+            d.insert(
+                tk.END, "  ▸ " + label + ": ",
+                "identity_label")
             tag = "na" if val in ("N/A", "None", "") else "identity_block"
-            d.insert(tk.END, val + chr(10), tag)
+            if key == "DOI" and tag != "na":
+                self._review_current_doi = val
+                d._identity_doi = val
+                self._insert_copyable_identity_value(
+                    d, key, label, val,
+                    ("identity_block", "doi_link"))
+            else:
+                self._insert_copyable_identity_value(
+                    d, key, label, val, tag)
+            identity_lines.append(label + ": " + val)
+        d._identity_copy_all_text = chr(10).join(identity_lines)
         d.insert(tk.END, chr(10))
 
         # ── Schema 字段(已剔除身份字段,避免重复)──
@@ -1379,29 +1835,236 @@ class App(TkinterDnD.Tk):
                 tag = "na" if v in ("N/A", "", "None") else None
                 d.insert(tk.END, "   " + v + chr(10), tag)
             d.insert(tk.END, chr(10))
-        d.configure(state=tk.DISABLED)
+        # 保持 NORMAL 以允许鼠标选中和 Ctrl+C；键盘编辑由绑定拦截。
+        d.configure(state=tk.NORMAL)
 
-    def _accept_paper(self):
+    def _copy_to_clipboard(self, text, description="内容"):
+        value = str(text or "")
+        if not value:
+            return False
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.update_idletasks()
+        self.status_var.set("已复制" + description)
+        self.after(
+            3000,
+            lambda: self.status_var.set("就绪")
+            if self.status_var.get() == "已复制" + description else None)
+        return True
+
+    def _copy_selected_text(self, widget):
+        try:
+            selected = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            return False
+        return self._copy_to_clipboard(selected, "选中文字")
+
+    def _readonly_copy_shortcut(self, event):
+        self._copy_selected_text(event.widget)
+        return "break"
+
+    @staticmethod
+    def _readonly_select_all(event):
+        event.widget.tag_add(tk.SEL, "1.0", "end-1c")
+        event.widget.tag_raise(tk.SEL)
+        event.widget.mark_set(tk.INSERT, "1.0")
+        event.widget.see("1.0")
+        return "break"
+
+    @staticmethod
+    def _raise_text_selection(event):
+        """Ensure selection paint stays above coloured content tags."""
+        try:
+            event.widget.tag_raise(tk.SEL)
+        except tk.TclError:
+            pass
+
+    def _install_readonly_copy_support(self, widget):
+        # Preserve the visible selection when focus moves to a copy command.
+        widget.configure(exportselection=False)
+        widget.bind("<Control-c>", self._readonly_copy_shortcut)
+        widget.bind("<Control-C>", self._readonly_copy_shortcut)
+        widget.bind("<Control-a>", self._readonly_select_all)
+        widget.bind("<Control-A>", self._readonly_select_all)
+        widget.bind("<ButtonPress-1>", self._raise_text_selection, add="+")
+        widget.tag_raise(tk.SEL)
+        widget.bind(
+            "<Button-3>",
+            lambda event: self._show_text_copy_menu(event, widget))
+        if not hasattr(widget, "_identity_copy_values"):
+            widget._identity_copy_values = {}
+        widget._identity_copy_all_text = ""
+        widget._identity_doi = ""
+
+    def _insert_copyable_identity_value(self, widget, key, label,
+                                        value, base_tag):
+        safe_key = re.sub(r"[^A-Za-z0-9_]", "_", str(key))
+        copy_tag = "copy_identity_" + safe_key
+        widget._identity_copy_values[copy_tag] = (str(label), str(value))
+        if isinstance(base_tag, (tuple, list)):
+            tags = tuple(base_tag) + (copy_tag,)
+        else:
+            tags = (base_tag, copy_tag) if base_tag else (copy_tag,)
+        widget.insert(tk.END, str(value) + chr(10), tags)
+        widget.tag_bind(
+            copy_tag, "<ButtonRelease-1>",
+            lambda event, tag=copy_tag:
+            self._copy_identity_tag_if_not_selecting(event, tag))
+        widget.tag_bind(
+            copy_tag, "<Enter>",
+            lambda event: event.widget.configure(cursor="hand2"))
+        widget.tag_bind(
+            copy_tag, "<Leave>",
+            lambda event: event.widget.configure(cursor="xterm"))
+
+    def _copy_identity_tag_if_not_selecting(self, event, tag):
+        try:
+            if event.widget.tag_ranges(tk.SEL):
+                return None
+        except tk.TclError:
+            return None
+        field = event.widget._identity_copy_values.get(tag)
+        if field:
+            label, value = field
+            self._copy_to_clipboard(value, "字段：" + label)
+        return None
+
+    def _identity_tag_at_pointer(self, widget, x, y):
+        try:
+            tags = widget.tag_names("@" + str(x) + "," + str(y))
+        except tk.TclError:
+            return None
+        return next((tag for tag in tags
+                     if str(tag).startswith("copy_identity_")), None)
+
+    def _show_text_copy_menu(self, event, widget):
+        copy_tag = self._identity_tag_at_pointer(
+            widget, event.x, event.y)
+        field = widget._identity_copy_values.get(copy_tag) if copy_tag else None
+        try:
+            has_selection = bool(widget.tag_ranges(tk.SEL))
+        except tk.TclError:
+            has_selection = False
+
+        previous_menu = getattr(widget, "_copy_context_menu", None)
+        if previous_menu is not None:
+            try:
+                previous_menu.destroy()
+            except tk.TclError:
+                pass
+        menu = tk.Menu(widget, tearoff=False)
+        widget._copy_context_menu = menu
+        menu.add_command(
+            label="复制选中文字",
+            state=tk.NORMAL if has_selection else tk.DISABLED,
+            command=lambda: self._copy_selected_text(widget))
+        menu.add_command(
+            label=("复制当前字段：" + field[0]
+                   if field else "复制当前字段"),
+            state=tk.NORMAL if field else tk.DISABLED,
+            command=(lambda selected=field:
+                     self._copy_to_clipboard(
+                         selected[1], "字段：" + selected[0])
+                     if selected else None))
+        menu.add_separator()
+        identity_text = str(getattr(
+            widget, "_identity_copy_all_text", "") or "")
+        menu.add_command(
+            label="复制全部身份信息",
+            state=tk.NORMAL if identity_text else tk.DISABLED,
+            command=lambda: self._copy_to_clipboard(
+                identity_text, "全部身份信息"))
+        doi = str(getattr(widget, "_identity_doi", "") or "")
+        menu.add_command(
+            label="复制 DOI",
+            state=(tk.NORMAL if doi and doi not in ("N/A", "None")
+                   else tk.DISABLED),
+            command=lambda: self._copy_to_clipboard(doi, " DOI"))
+        menu.add_separator()
+        menu.add_command(
+            label="全选",
+            command=lambda: (
+                widget.tag_add(tk.SEL, "1.0", "end-1c"),
+                widget.mark_set(tk.INSERT, "1.0")))
+        self.theme_manager.apply_widget(menu)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    @staticmethod
+    def _readonly_text_key(event):
+        """让 Text 保持可选中复制，但拦截输入、删除和粘贴。"""
+        key = str(event.keysym).lower()
+        control = bool(event.state & 0x4)
+        if control and key in ("c", "a"):
+            return None
+        if key in (
+                "left", "right", "up", "down",
+                "home", "end", "prior", "next"):
+            return None
+        return "break"
+
+    def _copy_review_doi(self):
+        doi = str(getattr(self, "_review_current_doi", "") or "").strip()
+        if not doi or doi in ("N/A", "None"):
+            messagebox.showinfo("提示", "当前条目没有可复制的 DOI")
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append(doi)
+        self.status_var.set("已复制 DOI：" + doi)
+        self.after(
+            3000,
+            lambda: self.status_var.set("就绪")
+            if self.status_var.get().startswith("已复制 DOI：") else None)
+        return "break"
+
+    def _accept_and_next(self):
+        children = list(self.review_tree.get_children())
+        selection = self.review_tree.selection()
+        next_index = (children.index(selection[0])
+                      if selection and selection[0] in children else 0)
+        self._accept_paper(show_message=False, next_index=next_index)
+
+    def _accept_paper(self, show_message: bool = True,
+                      next_index: int = 0):
         item = self._get_selected_review()
         if not item:
-            return
+            return False
         project_dir = self.settings.get("project_dir", "")
         paper_dir = Path(project_dir) / "extract_cache" / item["paper_id"]
         count = 0
-        for cache_file in paper_dir.glob(item["schema_ver"] + "_*.json"):
-            lang = cache_file.stem.split("_")[-1]
-            with open(cache_file, encoding="utf-8") as f:
-                data = json.load(f)
-            insert_paper(self.db_path,
-                         item["paper_id"] + "__" + lang,
-                         data, item["schema_ver"],
-                         data.get("_model", ""), lang)
-            count += 1
-        messagebox.showinfo(
-            "成功",
-            "已入库 " + str(count) + " 条(" + item["paper_id"] + ")")
+        try:
+            for cache_file in paper_dir.glob(item["schema_ver"] + "_*.json"):
+                lang = cache_file.stem.split("_")[-1]
+                with open(cache_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                insert_paper(self.db_path,
+                             item["paper_id"] + "__" + lang,
+                             data, item["schema_ver"],
+                             data.get("_model", ""), lang)
+                count += 1
+        except Exception as exc:
+            messagebox.showerror(
+                "收录失败", type(exc).__name__ + ": " + str(exc)[:200])
+            return False
+        if show_message:
+            messagebox.showinfo(
+                "成功",
+                "已入库 " + str(count) + " 条(" + item["paper_id"] + ")")
+        else:
+            self.review_status_label._theme_role = "success"
+            self.theme_manager.apply_widget(self.review_status_label)
+            self.review_status_var.set(
+                "✓ 已收录 " + item["paper_id"] + "，已定位下一篇"
+            )
+            self.after(2500, lambda: self.review_status_var.set(""))
         self._refresh_review_tab()
+        if not show_message:
+            self._select_review_index(next_item_index(
+                next_index, len(self.review_tree.get_children())))
         self._refresh_manage_tab()
+        return True
 
     def _reject_paper(self):
         item = self._get_selected_review()
@@ -1435,7 +2098,8 @@ class App(TkinterDnD.Tk):
 
         # 显示"正在重跑"状态
         self.review_status_var.set("⏳ 正在重跑 " + item["paper_id"] + " ...")
-        self.review_status_label.configure(fg="#0070C0")
+        self.review_status_label._theme_role = "accent"
+        self.theme_manager.apply_widget(self.review_status_label)
         self.status_var.set("正在重跑: " + item["paper_id"])
 
         def _worker():
@@ -1447,12 +2111,14 @@ class App(TkinterDnD.Tk):
                 self._refresh_manage_tab()
                 if ok:
                     self.review_status_var.set("✓ 重跑完成: " + item["paper_id"])
-                    self.review_status_label.configure(fg="#107C10")
+                    self.review_status_label._theme_role = "success"
+                    self.theme_manager.apply_widget(self.review_status_label)
                     self.status_var.set("重跑完成")
                     self.after(2000, lambda: self.review_status_var.set(""))
                 else:
                     self.review_status_var.set("✗ 重跑失败，请查看抽取页日志")
-                    self.review_status_label.configure(fg="#D13438")
+                    self.review_status_label._theme_role = "danger"
+                    self.theme_manager.apply_widget(self.review_status_label)
                     self.status_var.set("重跑失败")
                     self.after(5000, lambda: self.review_status_var.set(""))
 
@@ -1513,20 +2179,29 @@ class App(TkinterDnD.Tk):
 
         self.stats_label = tk.Label(frame, text="", fg="#1F4E79",
                                     font=("微软雅黑", 10, "bold"))
+        self.stats_label._theme_role = "accent"
         self.stats_label.pack(pady=2)
 
         filter_frame = ttk.Frame(frame)
         filter_frame.pack(fill=tk.X, padx=8, pady=2)
         ttk.Label(filter_frame, text="筛选:").pack(side=tk.LEFT)
         self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *a: self._apply_filter())
+        self.filter_var.trace_add(
+            "write", lambda *a: self._schedule_filter())
         ttk.Entry(filter_frame, textvariable=self.filter_var,
                   width=30).pack(side=tk.LEFT, padx=4)
         ttk.Label(filter_frame, text="字段:").pack(side=tk.LEFT, padx=(8, 2))
-        self.filter_field_var = tk.StringVar(value="全部")
-        ttk.Combobox(filter_frame, textvariable=self.filter_field_var,
-                     values=["全部", "文献ID", "语言", "版本", "模型"],
-                     width=10, state="readonly").pack(side=tk.LEFT)
+        self.filter_field_var = tk.StringVar(value="全部字段")
+        self.filter_field_combo = ttk.Combobox(
+            filter_frame, textvariable=self.filter_field_var,
+            values=[
+                "全部字段", "文献ID", "DOI", "标题", "作者", "期刊",
+                "年份", "关键词", "抽取内容", "语言", "版本", "模型",
+            ],
+            width=10, state="readonly")
+        self.filter_field_combo.pack(side=tk.LEFT)
+        self.filter_field_combo.bind(
+            "<<ComboboxSelected>>", lambda event: self._schedule_filter())
         ttk.Button(filter_frame, text="清除",
                    command=lambda: self.filter_var.set("")
                    ).pack(side=tk.LEFT, padx=4)
@@ -1566,10 +2241,11 @@ class App(TkinterDnD.Tk):
 
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        self.manage_tree_frame = tree_frame
 
         cols = ("seq", "paper_id", "schema_ver", "lang", "model", "added_at")
         self.manage_tree = ttk.Treeview(tree_frame, columns=cols,
-                                        show="headings", height=18,
+                                        show="headings", height=12,
                                         selectmode=tk.EXTENDED)
         self.manage_tree.heading("seq",        text="#")
         self.manage_tree.heading("paper_id",   text="文献ID")
@@ -1588,6 +2264,8 @@ class App(TkinterDnD.Tk):
         self.manage_tree.tag_configure("seq_odd",  background="#FFFFFF")
         self.manage_tree.tag_configure("seq_even", background="#F5F9FF")
         self.manage_tree.bind("<<TreeviewSelect>>", self._update_sel_count)
+        self.manage_tree.bind("<Double-1>",
+                              self._on_manage_tree_double_click)
 
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL,
                                   command=self.manage_tree.yview)
@@ -1595,8 +2273,46 @@ class App(TkinterDnD.Tk):
         self.manage_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.LEFT, fill=tk.Y)
 
+        page_bar = ttk.Frame(frame)
+        self.manage_page_bar = page_bar
+        page_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 2),
+                      before=tree_frame)
+        ttk.Label(page_bar, text="每页:").pack(side=tk.LEFT, padx=(2, 2))
+        self.manage_page_size_var = tk.StringVar(
+            value=str(self._manage_page_size))
+        page_size_combo = ttk.Combobox(
+            page_bar, textvariable=self.manage_page_size_var,
+            values=[str(value) for value in PAGE_SIZE_OPTIONS],
+            width=6, state="readonly")
+        page_size_combo.pack(side=tk.LEFT)
+        page_size_combo.bind(
+            "<<ComboboxSelected>>", self._on_manage_page_size_change)
+        self.manage_first_page_button = ttk.Button(
+            page_bar, text="首页", command=lambda: self._go_manage_page(1))
+        self.manage_first_page_button.pack(side=tk.LEFT, padx=(12, 2))
+        self.manage_prev_page_button = ttk.Button(
+            page_bar, text="上一页", command=lambda: self._go_manage_page(-1, True))
+        self.manage_prev_page_button.pack(side=tk.LEFT, padx=2)
+        self.manage_next_page_button = ttk.Button(
+            page_bar, text="下一页", command=lambda: self._go_manage_page(1, True))
+        self.manage_next_page_button.pack(side=tk.LEFT, padx=2)
+        self.manage_last_page_button = ttk.Button(
+            page_bar, text="末页", command=self._go_manage_last_page)
+        self.manage_last_page_button.pack(side=tk.LEFT, padx=2)
+        self.manage_page_info_var = tk.StringVar(value="第 1 / 1 页")
+        ttk.Label(page_bar, textvariable=self.manage_page_info_var).pack(
+            side=tk.LEFT, padx=10)
+        page_hint = tk.Label(
+            page_bar, text="选择状态可跨页保留", anchor=tk.E)
+        page_hint._theme_role = "muted"
+        page_hint.pack(side=tk.RIGHT, padx=4)
+
         bottom = ttk.Frame(frame)
-        bottom.pack(fill=tk.X, padx=8, pady=4)
+        self.manage_action_bar = bottom
+        # Reserve the action bar before the expandable table gets its space.
+        # This keeps the buttons visible on shorter screens and larger scaling.
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6),
+                    before=tree_frame)
         ttk.Button(bottom, text="❌ 删除选中",
                    command=lambda: self._delete_selected_db()
                    ).pack(side=tk.LEFT, padx=4)
@@ -1614,14 +2330,14 @@ class App(TkinterDnD.Tk):
         self._ai_button(bottom, text="💬 打开AI对话",
                         command=lambda: self._open_chat_window()
                         ).pack(side=tk.LEFT, padx=12)
-        ttk.Button(bottom, text="📋 导出选中引用",
-                   command=lambda: self._export_citations_selected()
-                   ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text="📋 导出全部引用",
-                   command=lambda: self._export_citations_all()
+        ttk.Button(bottom, text="📚 引用工具",
+                   command=lambda: self._open_citation_builder()
                    ).pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="🔧 重命名ID",
                    command=lambda: self._rename_paper_id_dialog()
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bottom, text="🧹 扫描重复",
+                   command=lambda: self._scan_database_duplicates()
                    ).pack(side=tk.LEFT, padx=4)
         ttk.Button(bottom, text="🔍 查找替换",
                    command=lambda: self._find_replace_dialog()
@@ -1657,6 +2373,8 @@ class App(TkinterDnD.Tk):
         save_settings(self.settings)
 
     def _on_db_change(self, event=None):
+        self._manage_selected_ids.clear()
+        self._manage_page = 1
         self._apply_db_change()
         self._refresh_manage_tab()
         self._chat_messages = []
@@ -1675,61 +2393,194 @@ class App(TkinterDnD.Tk):
     # ── 选择与筛选 ─────────────────────────────────
 
     def _select_all(self):
-        self.manage_tree.selection_set(self.manage_tree.get_children())
-        self._update_sel_count()
+        self._capture_manage_page_selection()
+        self._manage_selected_ids.update(
+            str(row[1]) for row in self._manage_filtered_rows)
+        self._render_manage_page()
 
     def _deselect_all(self):
-        self.manage_tree.selection_remove(self.manage_tree.get_children())
-        self._update_sel_count()
+        self._manage_selected_ids.clear()
+        self._render_manage_page()
 
     def _invert_select(self):
-        all_items = set(self.manage_tree.get_children())
-        selected = set(self.manage_tree.selection())
-        self.manage_tree.selection_set(list(all_items - selected))
-        self._update_sel_count()
+        self._capture_manage_page_selection()
+        filtered_ids = {str(row[1]) for row in self._manage_filtered_rows}
+        self._manage_selected_ids.symmetric_difference_update(filtered_ids)
+        self._render_manage_page()
+
+    def _capture_manage_page_selection(self):
+        """Merge the visible page's Treeview selection into cross-page state."""
+        if self._manage_selection_sync or not hasattr(self, "manage_tree"):
+            return
+        page_ids = set()
+        selected_ids = set()
+        selected_items = set(self.manage_tree.selection())
+        for item in self.manage_tree.get_children():
+            values = self.manage_tree.item(item, "values")
+            if len(values) < 2:
+                continue
+            paper_id = str(values[1])
+            page_ids.add(paper_id)
+            if item in selected_items:
+                selected_ids.add(paper_id)
+        self._manage_selected_ids.difference_update(page_ids)
+        self._manage_selected_ids.update(selected_ids)
+
+    def _selected_manage_ids(self) -> list:
+        """Return selected record IDs in stable database display order."""
+        self._capture_manage_page_selection()
+        return [
+            str(row[1]) for row in self._all_papers_cache
+            if str(row[1]) in self._manage_selected_ids
+        ]
 
     def _update_sel_count(self, event=None):
-        n = len(self.manage_tree.selection())
+        self._capture_manage_page_selection()
+        n = len(self._manage_selected_ids)
         if hasattr(self, "sel_count_label"):
-            self.sel_count_label.configure(text="已选 " + str(n) + " 条")
+            suffix = "（跨页）" if n > len(self.manage_tree.selection()) else ""
+            self.sel_count_label.configure(
+                text="已选 " + str(n) + " 条" + suffix)
 
-    def _apply_filter(self):
+    def _render_manage_page(self):
         if not hasattr(self, "manage_tree"):
             return
-        keyword = self.filter_var.get().strip().lower()
-        field = self.filter_field_var.get()
-
-        for item in self.manage_tree.get_children():
-            self.manage_tree.delete(item)
-
-        for row in self._all_papers_cache:
-            # row = (seq, paper_id, schema_ver, lang, model, added_at)
-            if not keyword:
-                match = True
-            elif field == "全部":
-                match = keyword in " ".join(str(v) for v in row).lower()
-            elif field == "文献ID":
-                match = keyword in str(row[1]).lower()
-            elif field == "版本":
-                match = keyword in str(row[2]).lower()
-            elif field == "语言":
-                match = keyword in str(row[3]).lower()
-            elif field == "模型":
-                match = keyword in str(row[4]).lower()
-            else:
-                match = keyword in " ".join(str(v) for v in row).lower()
-
-            if match:
+        page_rows, safe_page, total_pages = paginate_rows(
+            self._manage_filtered_rows, self._manage_page,
+            self._manage_page_size)
+        self._manage_page = safe_page
+        self._manage_selection_sync = True
+        try:
+            for item in self.manage_tree.get_children():
+                self.manage_tree.delete(item)
+            selected_items = []
+            for row in page_rows:
                 seq = row[0]
                 tag = "seq_even" if (seq % 2 == 0) else "seq_odd"
-                self.manage_tree.insert("", tk.END, values=row,
-                                        tags=(tag,))
+                item = self.manage_tree.insert(
+                    "", tk.END, values=row, tags=(tag,))
+                if str(row[1]) in self._manage_selected_ids:
+                    selected_items.append(item)
+            if selected_items:
+                self.manage_tree.selection_set(selected_items)
+        finally:
+            self._manage_selection_sync = False
 
+        total_rows = len(self._manage_filtered_rows)
+        start = ((safe_page - 1) * self._manage_page_size + 1
+                 if total_rows else 0)
+        end = min(safe_page * self._manage_page_size, total_rows)
+        if hasattr(self, "manage_page_info_var"):
+            self.manage_page_info_var.set(
+                "第 " + str(safe_page) + " / " + str(total_pages) +
+                " 页 · " + str(start) + "-" + str(end) +
+                " / " + str(total_rows) + " 条")
+            first_state = tk.DISABLED if safe_page <= 1 else tk.NORMAL
+            last_state = (tk.DISABLED if safe_page >= total_pages
+                          else tk.NORMAL)
+            self.manage_first_page_button.configure(state=first_state)
+            self.manage_prev_page_button.configure(state=first_state)
+            self.manage_next_page_button.configure(state=last_state)
+            self.manage_last_page_button.configure(state=last_state)
         self._update_sel_count()
 
+    def _go_manage_page(self, target: int, relative: bool = False):
+        self._capture_manage_page_selection()
+        self._manage_page = (
+            self._manage_page + target if relative else target)
+        self._render_manage_page()
+
+    def _go_manage_last_page(self):
+        _, _, total_pages = paginate_rows(
+            self._manage_filtered_rows, 1, self._manage_page_size)
+        self._go_manage_page(total_pages)
+
+    def _on_manage_page_size_change(self, event=None):
+        self._capture_manage_page_selection()
+        self._manage_page_size = normalize_page_size(
+            self.manage_page_size_var.get())
+        self.manage_page_size_var.set(str(self._manage_page_size))
+        self.settings["manage_page_size"] = self._manage_page_size
+        save_settings(self.settings)
+        self._manage_page = 1
+        self._render_manage_page()
+
+    def _select_manage_base_ids(self, base_ids, replace=True) -> set:
+        """Select matching bases across pages and reveal the first match."""
+        targets = {str(base) for base in base_ids}
+        matching_ids = [
+            str(row[1]) for row in self._manage_filtered_rows
+            if str(row[1]).rsplit("__", 1)[0] in targets
+        ]
+        if replace:
+            self._manage_selected_ids.clear()
+        self._manage_selected_ids.update(matching_ids)
+        if matching_ids:
+            first_id = matching_ids[0]
+            first_index = next(
+                index for index, row in enumerate(self._manage_filtered_rows)
+                if str(row[1]) == first_id)
+            self._manage_page = first_index // self._manage_page_size + 1
+        self._render_manage_page()
+        return {
+            paper_id.rsplit("__", 1)[0] for paper_id in matching_ids
+        }
+
+    def _on_manage_tree_double_click(self, event):
+        """双击文献 ID 列，直接打开单篇重命名窗口。"""
+        if self.manage_tree.identify("region", event.x, event.y) != "cell":
+            return
+        if self.manage_tree.identify_column(event.x) != "#2":
+            return
+        item = self.manage_tree.identify_row(event.y)
+        if not item:
+            return
+        values = self.manage_tree.item(item, "values")
+        self._manage_selected_ids = {str(values[1])}
+        self._render_manage_page()
+        self._rename_paper_id_dialog()
+
+    def _apply_filter(self, reset_page=True):
+        if not hasattr(self, "manage_tree"):
+            return
+        keyword = _normalize_search_text(self.filter_var.get())
+        field = self.filter_field_var.get()
+        tokens = [token for token in keyword.split(" ") if token]
+
+        matching_bases = set()
+        for base_id, documents in self._manage_base_search_index.items():
+            document = documents.get(
+                field, documents.get("全部字段", ""))
+            if not tokens or all(token in document for token in tokens):
+                matching_bases.add(base_id)
+
+        self._manage_filtered_rows = []
+        for row in self._all_papers_cache:
+            base = str(row[1]).rsplit("__", 1)[0]
+            if base in matching_bases:
+                self._manage_filtered_rows.append(row)
+        if reset_page:
+            self._manage_page = 1
+        self._render_manage_page()
+
+    def _schedule_filter(self, delay_ms=250):
+        """输入防抖：连续键入时只执行最后一次筛选。"""
+        if not hasattr(self, "manage_tree"):
+            return
+        if self._filter_after_id is not None:
+            try:
+                self.after_cancel(self._filter_after_id)
+            except Exception:
+                pass
+        self._filter_after_id = self.after(
+            delay_ms, self._run_scheduled_filter)
+
+    def _run_scheduled_filter(self):
+        self._filter_after_id = None
+        self._apply_filter()
+
     def _refresh_manage_tab(self):
-        for item in self.manage_tree.get_children():
-            self.manage_tree.delete(item)
+        self._capture_manage_page_selection()
 
         papers = get_all_papers(self.db_path)
 
@@ -1758,6 +2609,11 @@ class App(TkinterDnD.Tk):
 
         # ── 写入 Tree ──
         self._all_papers_cache = []
+        self._manage_papers_by_id = {}
+        self._manage_search_index = {}
+        self._manage_base_search_index = {}
+        cached_search_documents = build_cached_search_documents(
+            self.db_path, sorted_papers)
         for p in sorted_papers:
             base = p.get("_paper_id", "").rsplit("__", 1)[0]
             seq = base_to_seq.get(base, 0)
@@ -1770,8 +2626,23 @@ class App(TkinterDnD.Tk):
                 p.get("_added_at", "")[:19],
             )
             self._all_papers_cache.append(row)
-            tag = "seq_even" if (seq % 2 == 0) else "seq_odd"
-            self.manage_tree.insert("", tk.END, values=row, tags=(tag,))
+            full_id = p.get("_paper_id", "")
+            self._manage_papers_by_id[full_id] = p
+            self._manage_search_index[full_id] = (
+                cached_search_documents.get(full_id)
+                or _build_paper_search_document(p))
+            base_documents = self._manage_base_search_index.setdefault(
+                base, {})
+            for field_name, document in (
+                    self._manage_search_index[full_id].items()):
+                if document:
+                    base_documents[field_name] = (
+                        base_documents.get(field_name, "") + " " +
+                        document).strip()
+
+        valid_ids = {str(row[1]) for row in self._all_papers_cache}
+        self._manage_selected_ids.intersection_update(valid_ids)
+        self._apply_filter(reset_page=False)
 
         stats = get_stats(self.db_path)
         unique_count = len(base_to_seq)
@@ -1782,20 +2653,199 @@ class App(TkinterDnD.Tk):
                  + "   已拒绝:" + str(stats["rejected"]) + " 条")
         self._update_sel_count()
 
+    def _get_visible_base_ids(self) -> list:
+        """返回当前筛选结果中的基础文献 ID，保持界面顺序并去重。"""
+        result = []
+        seen = set()
+        for row in self._manage_filtered_rows:
+            base = str(row[1]).rsplit("__", 1)[0]
+            if base and base not in seen:
+                seen.add(base)
+                result.append(base)
+        return result
+
+    def _scan_database_duplicates(self):
+        """扫描当前文献库，预览并安全合并跨基础 ID 的重复文献。"""
+        groups = find_duplicate_groups(self.db_path)
+        if not groups:
+            messagebox.showinfo(
+                "重复扫描",
+                "当前文献库「" + self.db_name_var.get() +
+                "」未发现 DOI 或身份信息重复的基础文献。")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("文献库重复扫描 — " + self.db_name_var.get())
+        win.geometry("1080x680")
+        win.grab_set()
+
+        ttk.Label(
+            win,
+            text=("扫描规则：DOI 相同；或标题相同且年份/第一作者一致。"
+                  "中英文记录属于同一基础文献，不会互相误判。"),
+            foreground="#1F4E79",
+            font=("微软雅黑", 9)
+        ).pack(anchor=tk.W, padx=10, pady=(10, 4))
+        ttk.Label(
+            win,
+            text=("选择一行作为该重复组的保留 ID；合并时保留它的非空值，"
+                  "仅用其他记录填补空字段。★ 为系统推荐保留项。"),
+            foreground="#666",
+            font=("微软雅黑", 8)
+        ).pack(anchor=tk.W, padx=10, pady=(0, 6))
+
+        cols = ("group", "keep", "base_id", "langs",
+                "complete", "doi", "title")
+        tree = ttk.Treeview(
+            win, columns=cols, show="headings",
+            selectmode=tk.BROWSE, height=20)
+        headings = {
+            "group": "组",
+            "keep": "推荐",
+            "base_id": "基础文献 ID",
+            "langs": "语言",
+            "complete": "完整字段",
+            "doi": "DOI",
+            "title": "标题",
+        }
+        widths = {
+            "group": 45, "keep": 55, "base_id": 220,
+            "langs": 70, "complete": 75, "doi": 185, "title": 350,
+        }
+        for col in cols:
+            tree.heading(col, text=headings[col])
+            tree.column(
+                col, width=widths[col],
+                anchor=tk.CENTER if col in (
+                    "group", "keep", "langs", "complete") else tk.W)
+        tree.tag_configure("recommended", background="#E8F5E9")
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+
+        item_map = {}
+        first_recommended = None
+        for group_no, group in enumerate(groups, 1):
+            for record in group["records"]:
+                recommended = (
+                    record["base_id"] == group["recommended_keep"])
+                item_id = tree.insert(
+                    "", tk.END,
+                    values=(
+                        group_no,
+                        "★" if recommended else "",
+                        record["base_id"],
+                        "/".join(record["languages"]),
+                        record["completeness"],
+                        record["doi"],
+                        record["title"],
+                    ),
+                    tags=("recommended",) if recommended else ())
+                item_map[item_id] = (group, record)
+                if first_recommended is None and recommended:
+                    first_recommended = item_id
+
+        if first_recommended:
+            tree.selection_set(first_recommended)
+            tree.see(first_recommended)
+
+        reason_var = tk.StringVar()
+        tk.Label(
+            win, textvariable=reason_var, foreground="#8A5A00",
+            font=("微软雅黑", 9), anchor=tk.W
+        ).pack(fill=tk.X, padx=10, pady=2)
+
+        def _update_reason(event=None):
+            selected = tree.selection()
+            if not selected:
+                reason_var.set("")
+                return
+            group, _ = item_map[selected[0]]
+            reason_var.set("判重依据：" + group["reason"])
+
+        tree.bind("<<TreeviewSelect>>", _update_reason)
+        _update_reason()
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill=tk.X, padx=10, pady=8)
+
+        def _merge_selected_group():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning(
+                    "提示", "请先选择要保留的一行", parent=win)
+                return
+            group, record = item_map[selected[0]]
+            keep_id = record["base_id"]
+            remove_ids = [
+                base_id for base_id in group["base_ids"]
+                if base_id != keep_id]
+            if not messagebox.askyesno(
+                    "确认合并重复文献",
+                    "当前文献库：" + self.db_name_var.get() + chr(10) +
+                    "保留 ID：" + keep_id + chr(10) +
+                    "合并并移除：" + ", ".join(remove_ids) + chr(10) +
+                    "判重依据：" + group["reason"] + chr(10) + chr(10) +
+                    "目标记录的非空字段不会被覆盖；其他记录只用于填补空字段。"
+                    + chr(10) + "建议重要数据先备份。确认继续？",
+                    parent=win):
+                return
+
+            result = merge_duplicate_group(
+                self.db_path, keep_id, remove_ids,
+                self.settings.get("project_dir", ""))
+            if not result.get("ok"):
+                messagebox.showerror(
+                    "合并失败", result.get("error", "未知错误"),
+                    parent=win)
+                return
+
+            self._refresh_manage_tab()
+            win.destroy()
+            messagebox.showinfo(
+                "重复合并完成",
+                "保留：" + keep_id + chr(10) +
+                "合并记录：" + str(result["merged_rows"]) + " 条" +
+                chr(10) +
+                "补全空字段：" + str(result["filled_fields"]) + " 个")
+
+        ttk.Button(
+            btn_row, text="✓ 保留所选 ID 并合并本组",
+            command=_merge_selected_group
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            btn_row, text="🔧 重命名所选 ID",
+            command=lambda: _rename_from_duplicate_tree()
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            btn_row, text="关闭", command=win.destroy
+        ).pack(side=tk.RIGHT, padx=4)
+
+        def _rename_from_duplicate_tree():
+            selected = tree.selection()
+            if not selected:
+                return
+            _, record = item_map[selected[0]]
+            target_base = record["base_id"]
+            # 重复项可能不在当前页；清除筛选后由跨页选择器定位。
+            self.filter_var.set("")
+            self._apply_filter()
+            self._select_manage_base_ids([target_base])
+            win.destroy()
+            self._rename_paper_id_dialog()
+
     # ── 删除与详情 ─────────────────────────────────
 
     def _delete_selected_db(self):
-        selected = self.manage_tree.selection()
-        if not selected:
+        selected_ids = self._selected_manage_ids()
+        if not selected_ids:
             messagebox.showwarning("提示", "请先选中记录")
             return
         if not messagebox.askyesno(
                 "确认",
-                "删除选中的 " + str(len(selected)) + " 条记录?"):
+                "删除选中的 " + str(len(selected_ids)) + " 条记录?"):
             return
-        for item in selected:
-            paper_id = self.manage_tree.item(item, "values")[1]
+        for paper_id in selected_ids:
             delete_paper(self.db_path, paper_id)
+        self._manage_selected_ids.difference_update(selected_ids)
         self._refresh_manage_tab()
 
     def _rerun_selected_db(self):
@@ -1803,8 +2853,8 @@ class App(TkinterDnD.Tk):
         管理页批量重抽:对选中的每条记录调用 _do_rerun_one,
         重抽完会自动覆盖入库。后台线程跑,过程中不可中断。
         """
-        selected = self.manage_tree.selection()
-        if not selected:
+        selected_ids = self._selected_manage_ids()
+        if not selected_ids:
             messagebox.showwarning("提示", "请先选中要重抽的记录")
             return
         if not self.settings.get("api_key"):
@@ -1812,18 +2862,17 @@ class App(TkinterDnD.Tk):
             return
         if not messagebox.askyesno(
                 "确认",
-                "重抽选中的 " + str(len(selected)) + " 条记录?" + chr(10) +
+                "重抽选中的 " + str(len(selected_ids)) + " 条记录?" + chr(10) +
                 "AI 会重新跑一次,完成后自动覆盖数据库" + chr(10) +
                 "(过程中无法中断,请耐心等待)"):
             return
 
         # 收集任务信息(必须在主线程读 tree,因为 tkinter 控件非线程安全)
         tasks = []
-        for item in selected:
-            vals = self.manage_tree.item(item, "values")
-            full_id = vals[1]
-            schema_ver = vals[2]
-            lang = vals[3]
+        for full_id in selected_ids:
+            paper = self._manage_papers_by_id.get(full_id, {})
+            schema_ver = paper.get("_schema_ver", "")
+            lang = paper.get("_lang", "")
             base_id = full_id.rsplit("__", 1)[0]
             tasks.append((base_id, schema_ver, lang))
 
@@ -1850,10 +2899,10 @@ class App(TkinterDnD.Tk):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _view_db_detail(self):
-        selected = self.manage_tree.selection()
-        if not selected:
+        selected_ids = self._selected_manage_ids()
+        if not selected_ids:
             return
-        paper_id = self.manage_tree.item(selected[0], "values")[1]
+        paper_id = selected_ids[0]
         data = get_paper(self.db_path, paper_id)
         if not data:
             messagebox.showwarning("提示", "找不到该记录")
@@ -1893,6 +2942,12 @@ class App(TkinterDnD.Tk):
         edit_btn = ttk.Button(toolbar, text="✏ 编辑字段",
                               command=_toggle_edit)
         edit_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="📋 复制身份信息",
+                   command=lambda: _copy_identity(win)
+                   ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="📋 复制 DOI",
+                   command=lambda: _copy_doi(win)
+                   ).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="📋 复制原始JSON",
                    command=lambda: _copy_json(win)).pack(side=tk.LEFT, padx=4)
         ttk.Label(toolbar,
@@ -1911,8 +2966,10 @@ class App(TkinterDnD.Tk):
 
         render_text = scrolledtext.ScrolledText(
             left_frame, font=("微软雅黑", 9), wrap=tk.WORD,
-            state=tk.DISABLED)
+            state=tk.NORMAL)
         render_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        render_text.bind("<Key>", self._readonly_text_key)
+        self._install_readonly_copy_support(render_text)
 
         render_text.tag_config("title", foreground="#1F4E79",
                                font=("微软雅黑", 11, "bold"))
@@ -1929,6 +2986,43 @@ class App(TkinterDnD.Tk):
         render_text.tag_config("evidence", foreground="#666",
                                font=("微软雅黑", 8, "italic"))
         render_text.tag_config("na", foreground="#999")
+        render_text.tag_config(
+            "doi_link", foreground="#0066CC",
+            underline=True, font=("微软雅黑", 9, "bold"))
+
+        def _copy_doi(parent):
+            doi = str(data.get("DOI", "") or "").strip()
+            if not doi or doi in ("N/A", "None"):
+                messagebox.showinfo(
+                    "提示", "当前条目没有可复制的 DOI", parent=parent)
+                return "break"
+            parent.clipboard_clear()
+            parent.clipboard_append(doi)
+            self.status_var.set("已复制 DOI：" + doi)
+            self.after(
+                3000,
+                lambda: self.status_var.set("就绪")
+                if self.status_var.get().startswith("已复制 DOI：") else None)
+            return "break"
+
+        def _copy_identity(parent):
+            from schema_loader import IDENTITY_FIELDS
+            label_key = "label_" + item["lang"]
+            lines = ["文献ID: " + item["paper_id"]]
+            for field in IDENTITY_FIELDS:
+                key = field["key"]
+                value = data.get(key, "N/A")
+                if isinstance(value, (list, dict)):
+                    value = json.dumps(value, ensure_ascii=False)
+                lines.append(
+                    field.get(label_key, key) + ": " + str(value))
+            parent.clipboard_clear()
+            parent.clipboard_append(chr(10).join(lines))
+            self.status_var.set("已复制文献身份信息")
+            self.after(
+                3000,
+                lambda: self.status_var.set("就绪")
+                if self.status_var.get() == "已复制文献身份信息" else None)
 
         # 右侧：可编辑字段面板（初始隐藏，点编辑后展开）
         right_frame = ttk.LabelFrame(paned, text="字段编辑")
@@ -1958,6 +3052,9 @@ class App(TkinterDnD.Tk):
                 d = data
             from schema_loader import IDENTITY_FIELDS, IDENTITY_KEYS
             t = render_text
+            t._identity_copy_values = {}
+            t._identity_copy_all_text = ""
+            t._identity_doi = ""
             t.configure(state=tk.NORMAL)
             t.delete("1.0", tk.END)
             t.insert(tk.END, "📄 " + item["paper_id"] + chr(10), "title")
@@ -1970,6 +3067,10 @@ class App(TkinterDnD.Tk):
 
             label_key = "label_" + item["lang"]
             t.insert(tk.END, "═══ 文献身份信息 ═══" + chr(10), "section")
+            t.insert(tk.END,
+                     "单击字段值复制；按住鼠标拖动可任意选择文字。" +
+                     chr(10), "evidence")
+            identity_lines = ["文献ID: " + item["paper_id"]]
             for f in IDENTITY_FIELDS:
                 key = f["key"]
                 label = f.get(label_key, key)
@@ -1984,9 +3085,20 @@ class App(TkinterDnD.Tk):
                     val = "; ".join(p for p in parts if p) or "N/A"
                 else:
                     val = str(val) if val not in (None, "") else "N/A"
-                t.insert(tk.END, "  ▸ " + label + ": ", "identity_label")
+                t.insert(
+                    tk.END, "  ▸ " + label + ": ",
+                    "identity_label")
                 tag = "na" if val in ("N/A", "None", "") else "identity_block"
-                t.insert(tk.END, val + chr(10), tag)
+                if key == "DOI" and tag != "na":
+                    t._identity_doi = val
+                    self._insert_copyable_identity_value(
+                        t, key, label, val,
+                        ("identity_block", "doi_link"))
+                else:
+                    self._insert_copyable_identity_value(
+                        t, key, label, val, tag)
+                identity_lines.append(label + ": " + val)
+            t._identity_copy_all_text = chr(10).join(identity_lines)
             t.insert(tk.END, chr(10))
 
             try:
@@ -2120,7 +3232,8 @@ class App(TkinterDnD.Tk):
                         t.insert(tk.END, "   " + v + chr(10), tag)
                     t.insert(tk.END, chr(10))
 
-            t.configure(state=tk.DISABLED)
+            # 保持 NORMAL 以允许选中和 Ctrl+C；键盘编辑由绑定拦截。
+            t.configure(state=tk.NORMAL)
 
         def _enter_edit_mode():
             """展开右侧编辑面板，为每个非元数据字段生成输入框"""
@@ -2251,16 +3364,15 @@ class App(TkinterDnD.Tk):
 
     def _rename_paper_id_dialog(self):
         """管理页「🔧 重命名ID」按钮:弹出重命名弹窗"""
-        selected = self.manage_tree.selection()
-        if not selected:
+        selected_ids = self._selected_manage_ids()
+        if not selected_ids:
             messagebox.showwarning("提示", "请先选中至少一条记录")
             return
 
         # 收集选中的 base_id(去重,去掉 __zh/__en 后缀)
         base_ids = []
         seen = set()
-        for item in selected:
-            full_id = self.manage_tree.item(item, "values")[1]
+        for full_id in selected_ids:
             base = full_id.rsplit("__", 1)[0]
             if base not in seen:
                 seen.add(base)
@@ -2270,7 +3382,7 @@ class App(TkinterDnD.Tk):
 
         win = tk.Toplevel(self)
         win.title("重命名文献 ID")
-        win.geometry("780x560")
+        win.geometry("900x680")
         win.grab_set()
 
         # ── 说明文字 ──
@@ -2295,6 +3407,44 @@ class App(TkinterDnD.Tk):
         tpl_entry.pack(side=tk.LEFT, padx=6)
         ttk.Button(tpl_frame, text="预览",
                    command=lambda: _do_preview()).pack(side=tk.LEFT, padx=4)
+
+        preset_frame = ttk.Frame(win)
+        preset_frame.pack(fill=tk.X, padx=12, pady=(0, 4))
+        ttk.Label(preset_frame, text="快捷模板:").pack(side=tk.LEFT)
+        presets = [
+            ("作者_年份_期刊",
+             "{First_Author}_{Year}_{Journal_Abbr}"),
+            ("年份_作者_题目",
+             "{Year}_{First_Author}_{Title}"),
+            ("DOI",
+             "doi_{DOI}"),
+            ("期刊_年份_作者",
+             "{Journal_Abbr}_{Year}_{First_Author}"),
+        ]
+        for label, template in presets:
+            ttk.Button(
+                preset_frame, text=label,
+                command=lambda value=template: (
+                    tpl_var.set(value), _do_preview())
+            ).pack(side=tk.LEFT, padx=2)
+
+        direct_frame = ttk.Frame(win)
+        direct_frame.pack(fill=tk.X, padx=12, pady=(0, 6))
+        ttk.Label(direct_frame, text="直接改为:").pack(side=tk.LEFT)
+        direct_var = tk.StringVar(
+            value=base_ids[0] if len(base_ids) == 1 else "")
+        ttk.Entry(
+            direct_frame, textvariable=direct_var, width=48
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            direct_frame, text="预览直接 ID",
+            command=lambda: _do_direct_preview()
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Label(
+            direct_frame,
+            text="（仅选中一篇时可用；双击主列表 ID 可快速进入）",
+            foreground="#888"
+        ).pack(side=tk.LEFT, padx=4)
 
         # ── 预览表格 ──
         ttk.Label(win, text="预览(旧ID → 新ID):",
@@ -2450,6 +3600,46 @@ class App(TkinterDnD.Tk):
                       "加后缀: " + str(conflict_count) + " | "
                       "无变化: " + str(same_count) + " | "
                       "无数据: " + str(no_data_count)))
+
+        def _do_direct_preview():
+            nonlocal preview_data
+            if len(base_ids) != 1:
+                messagebox.showwarning(
+                    "提示",
+                    "直接 ID 仅支持单篇。批量重命名请使用上方模板。",
+                    parent=win)
+                return
+            new_id = _sanitize(direct_var.get().strip())
+            if not new_id:
+                messagebox.showwarning(
+                    "提示", "请输入新的文献 ID", parent=win)
+                return
+
+            old_id = base_ids[0]
+            tag = "same" if new_id == old_id else "ok"
+            resolved = _resolve_conflicts([(old_id, new_id, tag)])
+            preview_data.clear()
+            preview_data.extend(resolved)
+            for item_id in preview_tree.get_children():
+                preview_tree.delete(item_id)
+
+            status_map = {
+                "ok": "✓ 可重命名",
+                "conflict": "⚠ 已去重后缀",
+                "same": "— 无变化",
+                "no_data": "✗ 无数据",
+            }
+            for current_old, current_new, current_tag in resolved:
+                preview_tree.insert(
+                    "", tk.END,
+                    values=(
+                        current_old,
+                        current_new,
+                        status_map.get(current_tag, current_tag)),
+                    tags=(current_tag,))
+            status_label.configure(
+                text="直接重命名预览：" + old_id + " → " +
+                     resolved[0][1])
 
         # ── 执行按钮 ──
         btn_row = ttk.Frame(win)
@@ -3186,8 +4376,13 @@ class App(TkinterDnD.Tk):
         if not out_path:
             return
         try:
-            export_zip(self.settings.get("project_dir", ""), out_path)
-            messagebox.showinfo("成功", "已备份到:" + out_path)
+            result = export_zip(
+                self.settings.get("project_dir", ""), out_path)
+            messagebox.showinfo(
+                "备份完成",
+                "已备份 " + str(len(result.get("databases", []))) +
+                " 个文献库、" + str(result.get("file_count", 0)) +
+                " 个文件。" + NL + out_path)
         except Exception as e:
             messagebox.showerror("错误", str(e))
 
@@ -3195,91 +4390,1237 @@ class App(TkinterDnD.Tk):
         zip_path = filedialog.askopenfilename(filetypes=[("Zip", "*.zip")])
         if not zip_path:
             return
-        if not messagebox.askyesno(
-                "确认",
-                "导入会合并到当前数据库(已存在不覆盖)确认?"):
-            return
         try:
-            import_zip(zip_path, self.settings.get("project_dir", ""))
-            messagebox.showinfo("成功", "导入完成")
-            self._refresh_manage_tab()
+            info = inspect_backup(zip_path)
+        except Exception as e:
+            messagebox.showerror("无法读取备份", str(e))
+            return
+
+        win = tk.Toplevel(self)
+        win.title("导入文献库备份")
+        win.geometry("590x440")
+        win.transient(self)
+        win.grab_set()
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        version_desc = (
+            "新版备份 v" + str(info["format_version"])
+            if info.get("has_manifest") else "旧版兼容备份")
+        ttk.Label(
+            body,
+            text=version_desc + "；包含文献库：" +
+                 "、".join(info.get("databases", [])),
+            wraplength=550, foreground="#1F4E79",
+        ).pack(fill=tk.X, pady=(0, 12))
+
+        source_var = tk.StringVar(
+            value=(info.get("databases") or ["main"])[0])
+        source_row = ttk.Frame(body)
+        source_row.pack(fill=tk.X, pady=4)
+        ttk.Label(source_row, text="源文献库：", width=14).pack(side=tk.LEFT)
+        ttk.Combobox(
+            source_row, textvariable=source_var,
+            values=info.get("databases", []),
+            state="readonly", width=30).pack(side=tk.LEFT)
+
+        mode_var = tk.StringVar(value="merge")
+        mode_box = ttk.LabelFrame(body, text="导入方式", padding=8)
+        mode_box.pack(fill=tk.X, pady=10)
+        ttk.Radiobutton(
+            mode_box, text="安全合并到当前库（只补空字段，不覆盖已有值）",
+            variable=mode_var, value="merge").pack(anchor=tk.W, pady=3)
+        ttk.Radiobutton(
+            mode_box, text="导入为新文献库（备份含多库时全部保留）",
+            variable=mode_var, value="new_library").pack(anchor=tk.W, pady=3)
+        ttk.Radiobutton(
+            mode_box, text="替换当前库（替换前自动生成 .preimport 备份）",
+            variable=mode_var, value="replace").pack(anchor=tk.W, pady=3)
+
+        new_name_var = tk.StringVar(
+            value="imported_" + datetime.now().strftime("%Y%m%d"))
+        name_row = ttk.Frame(body)
+        name_row.pack(fill=tk.X, pady=4)
+        ttk.Label(name_row, text="新库名称前缀：", width=14).pack(side=tk.LEFT)
+        ttk.Entry(
+            name_row, textvariable=new_name_var,
+            width=32).pack(side=tk.LEFT)
+
+        confirmed = {"value": False}
+
+        def confirm_import():
+            if mode_var.get() == "replace":
+                if not messagebox.askyesno(
+                        "确认替换",
+                        "当前库会先自动备份，然后由所选源库替换。继续吗？",
+                        parent=win):
+                    return
+            confirmed["value"] = True
+            win.destroy()
+
+        actions = ttk.Frame(body)
+        actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
+        ttk.Button(
+            actions, text="取消", command=win.destroy
+        ).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(
+            actions, text="开始导入", command=confirm_import
+        ).pack(side=tk.RIGHT, padx=4)
+        self.wait_window(win)
+        if not confirmed["value"]:
+            return
+
+        try:
+            mode = mode_var.get()
+            result = import_zip(
+                zip_path,
+                self.settings.get("project_dir", ""),
+                mode=mode,
+                target_db_name=self.db_name_var.get(),
+                source_db_name=(
+                    None if mode == "new_library" else source_var.get()),
+                new_db_name=(
+                    new_name_var.get() if mode == "new_library" else None),
+            )
+            self._refresh_db_list()
+            lines = [
+                "导入完成",
+                "文献库：" +
+                "、".join(result.get("imported_databases", [])),
+            ]
+            if result.get("verified_files"):
+                lines.append(
+                    "完整性校验：" +
+                    str(result["verified_files"]) + " 个文件通过")
+            if mode == "merge":
+                lines.append(
+                    "新增 " + str(result.get("inserted", 0)) +
+                    " 条；合并/跳过 " + str(result.get("merged", 0)) + " 条")
+            if result.get("backups"):
+                lines.append("替换前备份：" + result["backups"][0])
+            messagebox.showinfo("成功", NL.join(lines))
         except Exception as e:
             messagebox.showerror("错误", str(e))
 
     # ── 引用导出 ───────────────────────────────────
 
-    def _export_citations_selected(self):
-        selected = self.manage_tree.selection()
-        if not selected:
-            messagebox.showwarning("提示", "请先选中记录")
+    def _citation_library_records(
+            self, language_mode="字段最完整（双语互补）") -> list:
+        grouped = {}
+        base_order = []
+        for paper in get_all_papers(self.db_path):
+            full_id = paper.get("_paper_id", "")
+            base = full_id.rsplit("__", 1)[0]
+            if base not in grouped:
+                base_order.append(base)
+            grouped.setdefault(base, []).append(paper)
+        records = []
+        for base in base_order:
+            record = select_citation_record(
+                grouped[base], language_mode)
+            record["_citation_base_id"] = base
+            records.append(record)
+        return records
+
+    def _citation_source_records(
+            self, language_mode="字段最完整（双语互补）") -> tuple:
+        selected_ids = self._selected_manage_ids()
+        if selected_ids:
+            selected_bases = {
+                str(paper_id).rsplit("__", 1)[0]
+                for paper_id in selected_ids
+            }
+            base_ids = []
+            for row in self._all_papers_cache:
+                base = str(row[1]).rsplit("__", 1)[0]
+                if base in selected_bases and base not in base_ids:
+                    base_ids.append(base)
+            scope = "已选文献"
+        else:
+            base_ids = self._get_visible_base_ids()
+            scope = (
+                "当前筛选结果"
+                if self.filter_var.get().strip() else "当前文献库全部文献"
+            )
+
+        library_records = self._citation_library_records(language_mode)
+        by_base = {
+            record.get("_citation_base_id"): record
+            for record in library_records}
+        records = [by_base[base] for base in base_ids if base in by_base]
+        return records, scope
+
+    def _open_citation_builder(self):
+        ordered, scope = self._citation_source_records()
+        if not ordered:
+            messagebox.showwarning(
+                "引用格式生成", "当前选择或筛选范围内没有可用文献。")
             return
-        paper_ids = [self.manage_tree.item(s, "values")[1] for s in selected]
-        self._do_export_citations(paper_ids)
 
-    def _export_citations_all(self):
-        self._do_export_citations(None)
-
-    def _do_export_citations(self, paper_ids):
-        results = export_citations(self.db_path, paper_ids)
-        if not results:
-            messagebox.showwarning("提示", "没有可导出的引用")
-            return
-
-        seen, unique = set(), []
-        for r in results:
-            base_id = r["paper_id"].rsplit("__", 1)[0]
-            if base_id not in seen:
-                seen.add(base_id)
-                unique.append(r)
-
+        project_dir = self.settings.get("project_dir", "")
+        schemes_payload = load_citation_schemes(project_dir)
+        if schemes_payload.get("warnings"):
+            messagebox.showwarning(
+                "引用方案恢复",
+                NL.join(schemes_payload["warnings"]),
+                parent=self)
         win = tk.Toplevel(self)
-        win.title("引用列表(ACS格式)— 共 " + str(len(unique)) + " 条")
-        win.geometry("900x600")
+        win.title("引用格式生成器 — " + self.db_name_var.get())
+        win.geometry("1260x840")
+        win.minsize(1040, 650)
+        win.transient(self)
 
-        top_bar = ttk.Frame(win)
-        top_bar.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(top_bar,
-                  text="共 " + str(len(unique)) + " 条",
-                  font=("微软雅黑", 10)).pack(side=tk.LEFT)
-        ttk.Button(top_bar, text="💾 保存为 .txt",
-                   command=lambda: self._save_citations_txt(unique)
-                   ).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(top_bar, text="📋 全部复制",
-                   command=lambda: self._copy_citations(unique, win)
-                   ).pack(side=tk.RIGHT, padx=4)
+        office_bridge = OfficeBridge()
+        session_store = CitationSessionStore(project_dir)
 
-        text_box = scrolledtext.ScrolledText(
-            win, font=("Times New Roman", 10),
-            wrap=tk.WORD, padx=8, pady=8)
-        text_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        text_box.tag_config("num", foreground="#0070C0",
-                            font=("微软雅黑", 10, "bold"))
-        text_box.tag_config("cite", foreground="#1A1A1A",
-                            font=("Times New Roman", 10))
-        for i, r in enumerate(unique, 1):
-            text_box.insert(tk.END, "(" + str(i) + ") ", "num")
-            text_box.insert(tk.END, r["citation"] + NL, "cite")
-        text_box.configure(state=tk.DISABLED)
+        def help_button(parent, title, text):
+            button = tk.Button(
+                parent, text="?", width=2, padx=1, pady=0,
+                relief=tk.FLAT, cursor="hand2",
+                command=lambda: messagebox.showinfo(
+                    title, text, parent=parent.winfo_toplevel()))
+            button._theme_role = "accent"
+            return button
 
-    def _save_citations_txt(self, results: list):
-        out_path = filedialog.asksaveasfilename(
-            initialfile="citations_" +
-                        datetime.now().strftime("%Y%m%d") + ".txt",
-            defaultextension=".txt",
-            filetypes=[("文本", "*.txt")])
-        if not out_path:
-            return
-        with open(out_path, "w", encoding="utf-8") as f:
-            for i, r in enumerate(results, 1):
-                f.write("(" + str(i) + ") " + r["citation"] + NL)
-        messagebox.showinfo("成功", "已保存到:" + out_path)
+        header = ttk.Frame(win, padding=(10, 8))
+        header.pack(fill=tk.X)
+        count_var = tk.StringVar()
+        ttk.Label(
+            header,
+            text="来源：" + scope,
+            foreground="#1F4E79",
+            font=("微软雅黑", 10, "bold"),
+        ).pack(side=tk.LEFT)
+        ttk.Label(header, textvariable=count_var).pack(side=tk.LEFT, padx=12)
+        citation_language_var = tk.StringVar(
+            value="字段最完整（双语互补）")
+        citation_language_combo = ttk.Combobox(
+            header, textvariable=citation_language_var,
+            values=[
+                "字段最完整（双语互补）",
+                "中文记录优先",
+                "英文记录优先",
+            ],
+            state="readonly", width=21)
+        citation_language_combo.pack(side=tk.LEFT, padx=8)
+        ttk.Label(
+            header,
+            text="未选文献时自动使用当前筛选结果",
+            foreground="#777777",
+        ).pack(side=tk.RIGHT)
 
-    def _copy_citations(self, results: list, win):
-        text = NL.join("(" + str(i) + ") " + r["citation"]
-                       for i, r in enumerate(results, 1))
-        win.clipboard_clear()
-        win.clipboard_append(text)
-        messagebox.showinfo("已复制", "引用已复制到剪贴板")
+        pane = ttk.Panedwindow(win, orient=tk.HORIZONTAL)
+        pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
+        left = ttk.Frame(pane)
+        right = ttk.Frame(pane)
+        pane.add(left, weight=5)
+        pane.add(right, weight=7)
+
+        order_box = ttk.LabelFrame(left, text="引用顺序", padding=6)
+        order_box.pack(fill=tk.BOTH, expand=True)
+        columns = ("seq", "title", "author", "year")
+        order_tree = ttk.Treeview(
+            order_box, columns=columns, show="headings",
+            selectmode=tk.BROWSE)
+        order_tree.heading("seq", text="#")
+        order_tree.heading("title", text="论文名称")
+        order_tree.heading("author", text="第一作者")
+        order_tree.heading("year", text="年份")
+        order_tree.column("seq", width=42, anchor=tk.CENTER, stretch=False)
+        order_tree.column("title", width=310)
+        order_tree.column("author", width=105)
+        order_tree.column("year", width=55, anchor=tk.CENTER)
+        order_scroll = ttk.Scrollbar(
+            order_box, orient=tk.VERTICAL, command=order_tree.yview)
+        order_tree.configure(yscrollcommand=order_scroll.set)
+        order_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        order_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        move_bar = ttk.Frame(left)
+        move_bar.pack(fill=tk.X, pady=6)
+        sort_var = tk.StringVar(value="排序方式")
+        sort_combo = ttk.Combobox(
+            move_bar, textvariable=sort_var,
+            values=["第一作者", "年份（升序）", "年份（降序）",
+                    "论文名称", "期刊名称"],
+            state="readonly", width=13)
+        sort_combo.pack(side=tk.RIGHT, padx=3)
+
+        scheme_box = ttk.LabelFrame(right, text="引用方案", padding=8)
+        scheme_box.pack(fill=tk.X)
+        scheme_name_var = tk.StringVar()
+        scheme_select_var = tk.StringVar()
+        number_var = tk.StringVar(value="[{n}]")
+        separator_var = tk.StringVar(value=NL)
+        inline_style_var = tk.StringVar(value="数字编号")
+        inline_template_var = tk.StringVar(value=DEFAULT_INLINE_TEMPLATE)
+        inline_item_template_var = tk.StringVar(
+            value=DEFAULT_INLINE_ITEM_TEMPLATE)
+        inline_separator_var = tk.StringVar(value=",")
+        compress_ranges_var = tk.BooleanVar(value=True)
+        content_mode_var = tk.StringVar(value="bibliography")
+        privacy_mode_var = tk.StringVar(value="privacy")
+        target_app_var = tk.StringVar(value="auto")
+        target_status_var = tk.StringVar(value="尚未检测 Word/WPS")
+        current_scheme_id = {"value": DEFAULT_SCHEME["id"]}
+
+        first_row = ttk.Frame(scheme_box)
+        first_row.pack(fill=tk.X, pady=2)
+        ttk.Label(first_row, text="读取方案：").pack(side=tk.LEFT)
+        scheme_combo = ttk.Combobox(
+            first_row, textvariable=scheme_select_var,
+            state="readonly", width=24)
+        scheme_combo.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(first_row, text="方案名称：").pack(side=tk.LEFT)
+        ttk.Entry(
+            first_row, textvariable=scheme_name_var,
+            width=24).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        second_row = ttk.Frame(scheme_box)
+        second_row.pack(fill=tk.X, pady=4)
+        ttk.Label(second_row, text="序号类型：").pack(side=tk.LEFT)
+        number_combo = ttk.Combobox(
+            second_row, textvariable=number_var,
+            values=["[{n}]", "{n}.", "({n})", "{circled}", ""],
+            width=13)
+        number_combo.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            second_row,
+            text="可自定义；{n}=序号，{circled}=圆圈序号",
+            foreground="#777777",
+        ).pack(side=tk.LEFT)
+
+        inline_row = ttk.Frame(scheme_box)
+        inline_row.pack(fill=tk.X, pady=3)
+        ttk.Label(inline_row, text="正文引用：").pack(side=tk.LEFT)
+        inline_style_combo = ttk.Combobox(
+            inline_row, textvariable=inline_style_var,
+            values=["数字编号", "作者-年份"],
+            state="readonly", width=12)
+        inline_style_combo.pack(side=tk.LEFT, padx=(0, 3))
+        help_button(
+            inline_row, "正文引用类型",
+            "numeric 使用文档级编号，例如 [1–3]；author_year 使用作者和年份，"
+            "例如 (Wang, 2024)。此设置会随引用方案保存。"
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(inline_row, text="外层模板：").pack(side=tk.LEFT)
+        ttk.Entry(
+            inline_row, textvariable=inline_template_var,
+            width=18).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(inline_row, text="分隔：").pack(side=tk.LEFT)
+        ttk.Entry(
+            inline_row, textvariable=inline_separator_var,
+            width=5).pack(side=tk.LEFT, padx=(0, 6))
+        inline_item_row = ttk.Frame(scheme_box)
+        inline_item_row.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(
+            inline_item_row,
+            text="作者年份单项模板：").pack(side=tk.LEFT)
+        ttk.Entry(
+            inline_item_row, textvariable=inline_item_template_var,
+            width=34).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(
+            inline_item_row,
+            text="可用 {author}、{year}、{title}",
+            foreground="#777777").pack(side=tk.LEFT)
+        inline_options_row = ttk.Frame(scheme_box)
+        inline_options_row.pack(fill=tk.X, pady=(0, 3))
+        ttk.Checkbutton(
+            inline_options_row, text="数字编号连续时压缩为范围（如 1,2,3 → 1–3）",
+            variable=compress_ranges_var).pack(side=tk.LEFT)
+
+        ttk.Label(
+            scheme_box,
+            text="格式模板（[[...]] 为可选块：块内字段为空时整块隐藏）：",
+        ).pack(anchor=tk.W, pady=(6, 2))
+        template_text = tk.Text(
+            scheme_box, height=3, wrap=tk.WORD,
+            font=("Consolas", 10), undo=True)
+        template_text.pack(fill=tk.X)
+
+        token_bar = ttk.Frame(scheme_box)
+        token_bar.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(token_bar, text="插入字段：").pack(side=tk.LEFT)
+        token_var = tk.StringVar(value=AVAILABLE_FIELDS[0])
+        token_combo = ttk.Combobox(
+            token_bar, textvariable=token_var,
+            values=AVAILABLE_FIELDS, state="readonly", width=23)
+        token_combo.pack(side=tk.LEFT, padx=3)
+
+        insert_box = ttk.LabelFrame(right, text="插入 Word / WPS", padding=6)
+        insert_box.pack(fill=tk.X, pady=(8, 0))
+
+        content_row = ttk.Frame(insert_box)
+        content_row.pack(fill=tk.X, pady=2)
+        ttk.Label(content_row, text="内容模式：").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            content_row, text="正文引用",
+            variable=content_mode_var, value="inline"
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        help_button(
+            content_row, "正文引用模式",
+            "在当前光标处插入 [1]、[1–3] 或 (作者, 年份) 等正文标记。"
+            "数字编号会按当前文档分别记录，重复引用沿用原编号。"
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(
+            content_row, text="完整参考文献",
+            variable=content_mode_var, value="bibliography"
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        help_button(
+            content_row, "完整参考文献模式",
+            "按当前引用方案把作者、标题、期刊、年份、DOI 等完整条目插入"
+            "光标位置；多篇按照左侧顺序一次性插入。"
+        ).pack(side=tk.LEFT)
+
+        privacy_row = ttk.Frame(insert_box)
+        privacy_row.pack(fill=tk.X, pady=2)
+        ttk.Label(privacy_row, text="记录模式：").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            privacy_row, text="隐私模式",
+            variable=privacy_mode_var, value="privacy"
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        help_button(
+            privacy_row, "隐私模式",
+            "默认推荐。paper_id、编号和插入历史只保存在 Lazybones 项目中，"
+            "不向 Word/WPS 文档写入隐藏标记，适合投稿和对外共享。"
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(
+            privacy_row, text="智能编辑模式",
+            variable=privacy_mode_var, value="smart"
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        help_button(
+            privacy_row, "智能编辑模式",
+            "在文档内容控件中只写入无意义的随机 UUID，用于后续识别引用。"
+            "该标记可被技术检查发现，投稿前应生成“投稿干净版”。"
+        ).pack(side=tk.LEFT)
+
+        target_row = ttk.Frame(insert_box)
+        target_row.pack(fill=tk.X, pady=(3, 1))
+        ttk.Label(target_row, text="目标：").pack(side=tk.LEFT)
+        ttk.Combobox(
+            target_row, textvariable=target_app_var,
+            values=["auto", "word", "wps"],
+            state="readonly", width=10).pack(side=tk.LEFT, padx=(0, 3))
+        help_button(
+            target_row, "目标程序",
+            "auto 自动连接已打开的 Word，未找到时再连接 WPS；如果两者同时"
+            "打开，请明确选择 word 或 wps，避免插入到错误文档。"
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(
+            target_row, textvariable=target_status_var,
+            foreground="#1F4E79").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        preview_box = ttk.LabelFrame(right, text="实时预览", padding=6)
+        preview_box.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        preview_text = scrolledtext.ScrolledText(
+            preview_box, wrap=tk.WORD,
+            font=("Times New Roman", 10), padx=8, pady=8)
+        preview_text.pack(fill=tk.BOTH, expand=True)
+
+        action_bar = ttk.Frame(win, padding=(10, 0, 10, 10))
+        action_bar.pack(side=tk.BOTTOM, fill=tk.X, before=pane)
+
+        def display_value(record, *keys):
+            for key in keys:
+                value = record.get(key)
+                if value not in (None, "", "N/A", [], {}):
+                    if isinstance(value, list):
+                        return "; ".join(
+                            str(item.get("value", ""))
+                            if isinstance(item, dict) else str(item)
+                            for item in value)
+                    return str(value)
+            return ""
+
+        def refresh_order_tree(selected_index=None):
+            order_tree.delete(*order_tree.get_children())
+            for index, record in enumerate(ordered):
+                order_tree.insert(
+                    "", tk.END, iid=str(index),
+                    values=(
+                        index + 1,
+                        display_value(record, "Title"),
+                        display_value(
+                            record, "First_Author", "Authors_Full", "Authors"),
+                        display_value(record, "Year"),
+                    ))
+            count_var.set("共 " + str(len(ordered)) + " 篇")
+            if ordered and selected_index is not None:
+                selected_index = max(
+                    0, min(selected_index, len(ordered) - 1))
+                order_tree.selection_set(str(selected_index))
+                order_tree.see(str(selected_index))
+            update_preview()
+
+        def change_citation_language(event=None):
+            refreshed, _ = self._citation_source_records(
+                citation_language_var.get())
+            refreshed_by_base = {
+                record.get("_citation_base_id"): record
+                for record in refreshed
+            }
+            current_order = [
+                record.get("_citation_base_id") for record in ordered]
+            ordered[:] = [
+                refreshed_by_base[base] for base in current_order
+                if base in refreshed_by_base
+            ]
+            refresh_order_tree(0)
+
+        citation_language_combo.bind(
+            "<<ComboboxSelected>>", change_citation_language)
+
+        def selected_index():
+            selected = order_tree.selection()
+            return int(selected[0]) if selected else None
+
+        def move_selected(offset=None, absolute=None):
+            index = selected_index()
+            if index is None:
+                return
+            if absolute == "top":
+                target = 0
+            elif absolute == "bottom":
+                target = len(ordered) - 1
+            else:
+                target = max(
+                    0, min(len(ordered) - 1, index + int(offset or 0)))
+            if target == index:
+                return
+            record = ordered.pop(index)
+            ordered.insert(target, record)
+            refresh_order_tree(target)
+
+        def remove_selected():
+            index = selected_index()
+            if index is None:
+                return
+            ordered.pop(index)
+            refresh_order_tree(min(index, len(ordered) - 1))
+
+        ttk.Button(
+            move_bar, text="置顶",
+            command=lambda: move_selected(absolute="top")
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            move_bar, text="上移",
+            command=lambda: move_selected(offset=-1)
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            move_bar, text="下移",
+            command=lambda: move_selected(offset=1)
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            move_bar, text="置底",
+            command=lambda: move_selected(absolute="bottom")
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            move_bar, text="移除",
+            command=remove_selected
+        ).pack(side=tk.LEFT, padx=8)
+
+        def sort_records(event=None):
+            field = sort_var.get()
+            key_map = {
+                "第一作者": ("First_Author", "Authors_Full", "Authors"),
+                "论文名称": ("Title",),
+                "期刊名称": ("Journal_Full", "Journal_Abbr", "Journal"),
+                "年份（升序）": ("Year",),
+                "年份（降序）": ("Year",),
+            }
+            keys = key_map.get(field)
+            if not keys:
+                return
+            ordered.sort(
+                key=lambda record: _normalize_search_text(
+                    display_value(record, *keys)),
+                reverse=(field == "年份（降序）"))
+            refresh_order_tree(0)
+
+        sort_combo.bind("<<ComboboxSelected>>", sort_records)
+
+        drag_state = {"index": None}
+
+        def drag_start(event):
+            row = order_tree.identify_row(event.y)
+            drag_state["index"] = int(row) if row else None
+
+        def drag_end(event):
+            source_index = drag_state.get("index")
+            target_row = order_tree.identify_row(event.y)
+            drag_state["index"] = None
+            if source_index is None or not target_row:
+                return
+            target_index = int(target_row)
+            if source_index == target_index:
+                return
+            record = ordered.pop(source_index)
+            ordered.insert(target_index, record)
+            refresh_order_tree(target_index)
+
+        order_tree.bind("<ButtonPress-1>", drag_start, add="+")
+        order_tree.bind("<ButtonRelease-1>", drag_end, add="+")
+
+        def current_scheme() -> dict:
+            return {
+                "name": scheme_name_var.get().strip() or "临时方案",
+                "number_format": number_var.get(),
+                "template": template_text.get("1.0", tk.END).strip(),
+                "separator": separator_var.get() or NL,
+                "inline_style": (
+                    "author_year"
+                    if inline_style_var.get() == "作者-年份"
+                    else "numeric"),
+                "inline_template": inline_template_var.get(),
+                "inline_item_template": inline_item_template_var.get(),
+                "inline_separator": inline_separator_var.get(),
+                "compress_ranges": compress_ranges_var.get(),
+            }
+
+        def rendered_lines():
+            return format_citation_list(ordered, current_scheme())
+
+        def rendered_text():
+            if content_mode_var.get() == "inline":
+                return format_inline_citation(ordered, current_scheme())
+            return (separator_var.get() or NL).join(rendered_lines())
+
+        def update_preview(*args):
+            if not preview_text.winfo_exists():
+                return
+            preview_text.configure(state=tk.NORMAL)
+            preview_text.delete("1.0", tk.END)
+            if content_mode_var.get() == "inline":
+                preview = format_inline_citation(
+                    ordered, current_scheme())
+            else:
+                preview = (separator_var.get() or NL).join(rendered_lines())
+            if preview:
+                preview_text.insert("1.0", preview)
+            else:
+                preview_text.insert("1.0", "引用列表为空。")
+            preview_text.configure(state=tk.DISABLED)
+
+        def template_modified(event=None):
+            if template_text.edit_modified():
+                template_text.edit_modified(False)
+                update_preview()
+
+        template_text.bind("<<Modified>>", template_modified)
+        number_var.trace_add("write", update_preview)
+        for variable in (
+                inline_style_var, inline_template_var,
+                inline_item_template_var, inline_separator_var,
+                compress_ranges_var, content_mode_var):
+            variable.trace_add("write", update_preview)
+
+        def schemes_by_name():
+            return {
+                scheme.get("name", scheme.get("id", "")): scheme
+                for scheme in schemes_payload.get("schemes", [])
+            }
+
+        def refresh_scheme_combo(select_id=None):
+            choices = schemes_payload.get("schemes", [])
+            scheme_combo["values"] = [
+                scheme.get("name", scheme.get("id", ""))
+                for scheme in choices]
+            selected = next(
+                (scheme for scheme in choices
+                 if scheme.get("id") == select_id),
+                choices[0] if choices else DEFAULT_SCHEME)
+            scheme_select_var.set(selected.get("name", ""))
+            load_scheme(selected)
+
+        def load_scheme(scheme):
+            scheme = normalize_citation_scheme(scheme)
+            current_scheme_id["value"] = scheme.get(
+                "id", DEFAULT_SCHEME["id"])
+            scheme_name_var.set(scheme.get("name", ""))
+            number_var.set(scheme.get("number_format", "[{n}]"))
+            separator_var.set(scheme.get("separator", NL))
+            template_text.delete("1.0", tk.END)
+            template_text.insert(
+                "1.0", scheme.get("template", DEFAULT_TEMPLATE))
+            inline_style_var.set(
+                "作者-年份"
+                if scheme.get("inline_style") == "author_year"
+                else "数字编号")
+            inline_template_var.set(
+                scheme.get("inline_template", DEFAULT_INLINE_TEMPLATE))
+            inline_item_template_var.set(scheme.get(
+                "inline_item_template", DEFAULT_INLINE_ITEM_TEMPLATE))
+            inline_separator_var.set(scheme.get("inline_separator", ","))
+            compress_ranges_var.set(bool(
+                scheme.get("compress_ranges", True)))
+            template_text.edit_modified(False)
+            update_preview()
+
+        def on_scheme_selected(event=None):
+            scheme = schemes_by_name().get(scheme_select_var.get())
+            if scheme:
+                load_scheme(scheme)
+
+        scheme_combo.bind("<<ComboboxSelected>>", on_scheme_selected)
+
+        def insert_token():
+            template_text.insert(
+                tk.INSERT, "{" + token_var.get() + "}")
+            template_text.edit_modified(True)
+
+        ttk.Button(
+            token_bar, text="插入",
+            command=insert_token).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            token_bar, text="插入可选块",
+            command=lambda: (
+                template_text.insert(
+                    tk.INSERT, "[[{" + token_var.get() + "}]]"),
+                template_text.edit_modified(True),
+            )).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            token_bar, text="恢复完整默认格式",
+            command=lambda: (
+                template_text.delete("1.0", tk.END),
+                template_text.insert("1.0", DEFAULT_TEMPLATE),
+                template_text.edit_modified(True),
+            )).pack(side=tk.RIGHT, padx=2)
+
+        scheme_actions = ttk.Frame(scheme_box)
+        scheme_actions.pack(fill=tk.X, pady=(5, 0))
+
+        def save_scheme(as_new):
+            name = scheme_name_var.get().strip()
+            template = template_text.get("1.0", tk.END).strip()
+            if not name or not template:
+                messagebox.showwarning(
+                    "引用方案", "方案名称和格式模板不能为空。", parent=win)
+                return
+            if template.count("[[") != template.count("]]"):
+                messagebox.showwarning(
+                    "引用方案",
+                    "可选块标记不成对，请检查 [[ 和 ]]。",
+                    parent=win)
+                return
+            if template.count("{") != template.count("}"):
+                messagebox.showwarning(
+                    "引用方案",
+                    "字段标记不成对，请检查 { 和 }。",
+                    parent=win)
+                return
+            scheme_id = None
+            if not as_new:
+                active = next(
+                    (scheme for scheme in schemes_payload.get("schemes", [])
+                     if scheme.get("id") == current_scheme_id["value"]),
+                    None)
+                if active and active.get("builtin"):
+                    messagebox.showinfo(
+                        "内置方案",
+                        "内置方案不能覆盖，请使用“另存新方案”。",
+                        parent=win)
+                    return
+                scheme_id = current_scheme_id["value"]
+            try:
+                saved = upsert_citation_scheme(
+                    project_dir, schemes_payload, name,
+                    number_var.get(), template,
+                    separator_var.get() or NL, scheme_id=scheme_id,
+                    inline_style=(
+                        "author_year"
+                        if inline_style_var.get() == "作者-年份"
+                        else "numeric"),
+                    inline_template=inline_template_var.get(),
+                    inline_item_template=inline_item_template_var.get(),
+                    inline_separator=inline_separator_var.get(),
+                    compress_ranges=compress_ranges_var.get())
+            except ValueError as error:
+                messagebox.showwarning(
+                    "引用方案", str(error), parent=win)
+                return
+            refresh_scheme_combo(saved["id"])
+            messagebox.showinfo(
+                "引用方案", "方案已保存，下次启动可继续使用。", parent=win)
+
+        def remove_scheme():
+            scheme_id = current_scheme_id["value"]
+            if not delete_citation_scheme(
+                    project_dir, schemes_payload, scheme_id):
+                messagebox.showinfo(
+                    "引用方案", "内置默认方案不能删除。", parent=win)
+                return
+            refresh_scheme_combo(DEFAULT_SCHEME["id"])
+
+        def set_default_scheme():
+            schemes_payload["default_scheme_id"] = current_scheme_id["value"]
+            save_citation_schemes(project_dir, schemes_payload)
+            messagebox.showinfo(
+                "引用方案", "已设为下次打开时的默认方案。", parent=win)
+
+        ttk.Button(
+            scheme_actions, text="另存新方案",
+            command=lambda: save_scheme(True)
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            scheme_actions, text="覆盖当前方案",
+            command=lambda: save_scheme(False)
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            scheme_actions, text="删除当前方案",
+            command=remove_scheme
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Button(
+            scheme_actions, text="设为启动默认",
+            command=set_default_scheme
+        ).pack(side=tk.LEFT, padx=2)
+
+        def detect_target(parent=win, quiet=False):
+            try:
+                target = office_bridge.get_target(target_app_var.get())
+                target_status_var.set(
+                    "● " + target.app_name + " — " + target.document_name)
+                return target
+            except OfficeBridgeError as error:
+                target_status_var.set("○ 未连接 Word/WPS")
+                if not quiet:
+                    messagebox.showwarning(
+                        "未连接文档", str(error), parent=parent)
+                return None
+
+        ttk.Button(
+            target_row, text="检测",
+            command=lambda: detect_target(win)
+        ).pack(side=tk.RIGHT, padx=2)
+
+        def prepare_insertion(records, target):
+            paper_ids = [
+                str(record.get("_citation_base_id", ""))
+                for record in records
+                if record.get("_citation_base_id")]
+            session, number_map, token_map = session_store.prepare(
+                target.public(), paper_ids)
+            scheme = current_scheme()
+            if content_mode_var.get() == "inline":
+                text = format_inline_citation(
+                    records, scheme, number_map=number_map)
+            else:
+                lines = [
+                    format_citation(
+                        record, scheme,
+                        number_map.get(
+                            str(record.get("_citation_base_id", "")), index))
+                    for index, record in enumerate(records, 1)
+                ]
+                text = (scheme.get("separator") or NL).join(lines)
+            return paper_ids, session, token_map, text
+
+        def insert_records(records, parent=win, clear_callback=None):
+            if not records:
+                messagebox.showwarning(
+                    "插入引用", "请先选择至少一篇文献。", parent=parent)
+                return
+            target = detect_target(parent)
+            if target is None:
+                return
+            try:
+                paper_ids, session, token_map, text = prepare_insertion(
+                    records, target)
+                smart_token = ""
+                if privacy_mode_var.get() == "smart":
+                    smart_token = session_store.create_smart_group(
+                        target.public(), session, paper_ids)
+                result = office_bridge.insert(
+                    text, app_id=target.app_id,
+                    smart_token=smart_token)
+                session_store.record_insertion(
+                    result["target"], session, paper_ids,
+                    current_scheme_id["value"], content_mode_var.get(),
+                    privacy_mode_var.get(), text)
+                if (privacy_mode_var.get() == "smart"
+                        and not result.get("smart_applied")):
+                    messagebox.showwarning(
+                        "已按隐私模式插入",
+                        "当前 Word/WPS 版本不支持智能内容控件，引用已经作为普通"
+                        "文字插入，文档中没有写入隐藏标记。",
+                        parent=parent)
+                self.status_var.set(
+                    "已向 " + result["target"]["app_name"] + " 插入 " +
+                    str(len(records)) + " 篇引用")
+                target_status_var.set(
+                    "● " + result["target"]["app_name"] + " — " +
+                    result["target"]["document_name"])
+                if clear_callback is not None:
+                    clear_callback()
+            except (OfficeBridgeError, OSError, ValueError) as error:
+                messagebox.showerror(
+                    "插入失败", str(error), parent=parent)
+
+        def create_clean_submission_copy(parent=win):
+            target = detect_target(parent)
+            if target is None:
+                return
+            source_name = Path(
+                target.document_name or "manuscript.docx").stem
+            output = filedialog.asksaveasfilename(
+                parent=parent,
+                initialdir=str(Path(project_dir) / "exports"),
+                initialfile=source_name + "_submission_clean.docx",
+                defaultextension=".docx",
+                filetypes=[("Word 文档", "*.docx")])
+            if not output:
+                return
+            try:
+                result = office_bridge.create_clean_copy(
+                    output, target.app_id)
+            except OfficeBridgeError as error:
+                messagebox.showerror(
+                    "投稿干净版", str(error), parent=parent)
+                return
+            if result["clean"]:
+                messagebox.showinfo(
+                    "投稿干净版已生成",
+                    "文件：" + result["output_path"] + NL +
+                    "已移除 Lazybones 标记：" + str(result["removed"]) +
+                    " 个" + NL + "内部复检：未发现 Lazybones 隐藏标记。" +
+                    NL2 + "建议投稿前再运行 Word 的“检查文档”。",
+                    parent=parent)
+            else:
+                messagebox.showwarning(
+                    "仍检测到隐藏标记",
+                    "干净版已生成，但以下内部文件仍有 Lazybones 标记：" +
+                    NL.join(result["marker_files"][:10]),
+                    parent=parent)
+
+        floating_window = {"value": None}
+
+        def open_floating_inserter():
+            existing = floating_window.get("value")
+            try:
+                if existing is not None and existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    return
+            except tk.TclError:
+                pass
+
+            floating = tk.Toplevel(self)
+            floating_window["value"] = floating
+            floating.title("Lazybones 悬浮引用插入器")
+            floating.geometry("620x640")
+            floating.minsize(520, 500)
+            floating.attributes("-topmost", True)
+
+            float_header = ttk.Frame(floating, padding=8)
+            float_header.pack(fill=tk.X)
+            pin_var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(
+                float_header, text="始终置顶", variable=pin_var,
+                command=lambda: floating.attributes(
+                    "-topmost", pin_var.get())
+            ).pack(side=tk.LEFT)
+            ttk.Button(
+                float_header, text="展开完整页面",
+                command=lambda: (win.deiconify(), win.lift())
+            ).pack(side=tk.RIGHT)
+
+            float_scheme_row = ttk.Frame(floating, padding=(8, 0))
+            float_scheme_row.pack(fill=tk.X, pady=3)
+            ttk.Label(float_scheme_row, text="引用方案：").pack(side=tk.LEFT)
+            float_scheme_combo = ttk.Combobox(
+                float_scheme_row, textvariable=scheme_select_var,
+                values=list(schemes_by_name()),
+                state="readonly", width=24)
+            float_scheme_combo.pack(side=tk.LEFT, padx=3)
+            float_scheme_combo.bind(
+                "<<ComboboxSelected>>", on_scheme_selected)
+
+            float_mode_box = ttk.LabelFrame(
+                floating, text="插入方式", padding=6)
+            float_mode_box.pack(fill=tk.X, padx=8, pady=4)
+            row_one = ttk.Frame(float_mode_box)
+            row_one.pack(fill=tk.X, pady=2)
+            ttk.Radiobutton(
+                row_one, text="正文引用", variable=content_mode_var,
+                value="inline").pack(side=tk.LEFT)
+            help_button(
+                row_one, "正文引用模式",
+                "插入 [1]、[1–3] 或 (作者, 年份)，重复文献沿用当前文档编号。"
+            ).pack(side=tk.LEFT, padx=(2, 10))
+            ttk.Radiobutton(
+                row_one, text="完整参考文献", variable=content_mode_var,
+                value="bibliography").pack(side=tk.LEFT)
+            help_button(
+                row_one, "完整参考文献模式",
+                "按引用方案插入完整条目，多篇按照当前列表顺序排列。"
+            ).pack(side=tk.LEFT, padx=2)
+            row_two = ttk.Frame(float_mode_box)
+            row_two.pack(fill=tk.X, pady=2)
+            ttk.Radiobutton(
+                row_two, text="隐私模式", variable=privacy_mode_var,
+                value="privacy").pack(side=tk.LEFT)
+            help_button(
+                row_two, "隐私模式",
+                "只在 Lazybones 项目保存引用记录，文档中没有隐藏 paper_id。"
+            ).pack(side=tk.LEFT, padx=(2, 10))
+            ttk.Radiobutton(
+                row_two, text="智能编辑", variable=privacy_mode_var,
+                value="smart").pack(side=tk.LEFT)
+            help_button(
+                row_two, "智能编辑模式",
+                "文档只写随机 UUID，便于后续识别；投稿前应生成干净版。"
+            ).pack(side=tk.LEFT, padx=2)
+
+            float_target_row = ttk.Frame(floating, padding=(8, 0))
+            float_target_row.pack(fill=tk.X, pady=3)
+            ttk.Combobox(
+                float_target_row, textvariable=target_app_var,
+                values=["auto", "word", "wps"], state="readonly",
+                width=9).pack(side=tk.LEFT)
+            ttk.Label(
+                float_target_row, textvariable=target_status_var,
+                foreground="#1F4E79").pack(
+                    side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+            ttk.Button(
+                float_target_row, text="检测",
+                command=lambda: detect_target(floating)
+            ).pack(side=tk.RIGHT)
+
+            search_var = tk.StringVar()
+            search_entry = ttk.Entry(
+                floating, textvariable=search_var)
+            search_entry.pack(fill=tk.X, padx=8, pady=4)
+
+            list_frame = ttk.Frame(floating)
+            list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=3)
+            float_tree = ttk.Treeview(
+                list_frame, columns=("title", "author", "year"),
+                show="headings", selectmode=tk.EXTENDED)
+            float_tree.heading("title", text="论文名称")
+            float_tree.heading("author", text="第一作者")
+            float_tree.heading("year", text="年份")
+            float_tree.column("title", width=310)
+            float_tree.column("author", width=120)
+            float_tree.column("year", width=58, anchor=tk.CENTER)
+            float_scroll = ttk.Scrollbar(
+                list_frame, orient=tk.VERTICAL, command=float_tree.yview)
+            float_tree.configure(yscrollcommand=float_scroll.set)
+            float_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            float_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+            available_records = self._citation_library_records(
+                citation_language_var.get())
+            visible_records = []
+            selected_float_ids = {
+                str(record.get("_citation_base_id", ""))
+                for record in ordered}
+            selection_guard = {"active": False}
+
+            def refresh_float_list(*args):
+                query = _normalize_search_text(search_var.get())
+                visible_records.clear()
+                float_tree.delete(*float_tree.get_children())
+                selected_rows = []
+                for record in available_records:
+                    haystack = _normalize_search_text(" ".join((
+                        display_value(record, "Title"),
+                        display_value(
+                            record, "First_Author", "Authors_Full"),
+                        display_value(record, "Year"),
+                        display_value(record, "DOI"),
+                        display_value(record, "Journal_Full"),
+                    )))
+                    if query and query not in haystack:
+                        continue
+                    index = len(visible_records)
+                    visible_records.append(record)
+                    float_tree.insert(
+                        "", tk.END, iid=str(index), values=(
+                            display_value(record, "Title"),
+                            display_value(
+                                record, "First_Author", "Authors_Full"),
+                            display_value(record, "Year")))
+                    if str(record.get(
+                            "_citation_base_id", "")) in selected_float_ids:
+                        selected_rows.append(str(index))
+                if selected_rows:
+                    selection_guard["active"] = True
+                    float_tree.selection_set(selected_rows)
+                    selection_guard["active"] = False
+
+            def sync_order_from_float():
+                lookup = {
+                    str(record.get("_citation_base_id", "")): record
+                    for record in available_records}
+                current_ids = [
+                    str(record.get("_citation_base_id", ""))
+                    for record in ordered]
+                next_ids = [
+                    base_id for base_id in current_ids
+                    if base_id in selected_float_ids]
+                next_ids.extend(
+                    base_id for base_id in lookup
+                    if (base_id in selected_float_ids
+                        and base_id not in next_ids))
+                ordered[:] = [lookup[base_id] for base_id in next_ids]
+                refresh_order_tree(0 if ordered else None)
+
+            def on_float_selection(event=None):
+                if selection_guard["active"]:
+                    return
+                visible_ids = {
+                    str(record.get("_citation_base_id", ""))
+                    for record in visible_records}
+                selected_now = {
+                    str(visible_records[int(item)].get(
+                        "_citation_base_id", ""))
+                    for item in float_tree.selection()
+                    if int(item) < len(visible_records)}
+                selected_float_ids.difference_update(visible_ids)
+                selected_float_ids.update(selected_now)
+                sync_order_from_float()
+
+            def selected_float_records():
+                return list(ordered)
+
+            def select_all_visible():
+                float_tree.selection_set(float_tree.get_children())
+                on_float_selection()
+
+            def clear_all_selection():
+                selected_float_ids.clear()
+                selection_guard["active"] = True
+                float_tree.selection_remove(float_tree.selection())
+                selection_guard["active"] = False
+                sync_order_from_float()
+
+            search_var.trace_add("write", refresh_float_list)
+            float_tree.bind(
+                "<<TreeviewSelect>>", on_float_selection, add="+")
+            refresh_float_list()
+
+            float_actions = ttk.Frame(floating, padding=8)
+            float_actions.pack(
+                side=tk.BOTTOM, fill=tk.X, before=list_frame)
+            ttk.Button(
+                float_actions, text="全选",
+                command=select_all_visible
+            ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                float_actions, text="全不选",
+                command=clear_all_selection
+            ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(
+                float_actions, text="生成投稿干净版",
+                command=lambda: create_clean_submission_copy(floating)
+            ).pack(side=tk.RIGHT, padx=2)
+            ttk.Button(
+                float_actions, text="插入",
+                style="Accent.TButton",
+                command=lambda: insert_records(
+                    selected_float_records(), floating)
+            ).pack(side=tk.RIGHT, padx=2)
+            ttk.Button(
+                float_actions, text="插入并清空",
+                command=lambda: insert_records(
+                    selected_float_records(), floating,
+                    clear_all_selection)
+            ).pack(side=tk.RIGHT, padx=2)
+            detect_target(floating, quiet=True)
+
+        def copy_output():
+            text = rendered_text()
+            win.clipboard_clear()
+            win.clipboard_append(text)
+            win.update()
+            self.status_var.set(
+                "已复制 " + str(len(ordered)) + " 条引用到剪贴板")
+
+        def export_text(extension):
+            if not ordered:
+                return
+            filetypes = (
+                [("Markdown", "*.md")] if extension == ".md"
+                else [("文本", "*.txt")])
+            path = filedialog.asksaveasfilename(
+                parent=win,
+                initialdir=str(Path(project_dir) / "exports"),
+                initialfile=(
+                    "citations_" + datetime.now().strftime("%Y%m%d") +
+                    extension),
+                defaultextension=extension,
+                filetypes=filetypes)
+            if not path:
+                return
+            Path(path).write_text(rendered_text(), encoding="utf-8")
+            messagebox.showinfo(
+                "导出成功", "已导出到：" + path, parent=win)
+
+        def export_word():
+            if not ordered:
+                return
+            path = filedialog.asksaveasfilename(
+                parent=win,
+                initialdir=str(Path(project_dir) / "exports"),
+                initialfile=(
+                    "citations_" + datetime.now().strftime("%Y%m%d") +
+                    ".docx"),
+                defaultextension=".docx",
+                filetypes=[("Word 文档", "*.docx")])
+            if not path:
+                return
+            try:
+                from docx import Document
+                document = Document()
+                document.add_heading("References", level=1)
+                for citation in rendered_lines():
+                    document.add_paragraph(citation)
+                document.save(path)
+                messagebox.showinfo(
+                    "导出成功", "已导出到：" + path, parent=win)
+            except Exception as e:
+                messagebox.showerror("Word 导出失败", str(e), parent=win)
+
+        ttk.Button(
+            action_bar, text="关闭",
+            command=win.destroy).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(
+            action_bar, text="导出 Word",
+            command=export_word).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(
+            action_bar, text="导出 Markdown",
+            command=lambda: export_text(".md")
+        ).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(
+            action_bar, text="导出 TXT",
+            command=lambda: export_text(".txt")
+        ).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(
+            action_bar, text="复制全部",
+            command=copy_output).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(
+            action_bar, text="📌 悬浮插入器",
+            command=open_floating_inserter,
+            style="Accent.TButton").pack(side=tk.LEFT, padx=3)
+        ttk.Button(
+            action_bar, text="插入当前列表",
+            command=lambda: insert_records(ordered, win)
+        ).pack(side=tk.LEFT, padx=3)
+        ttk.Button(
+            action_bar, text="生成投稿干净版",
+            command=lambda: create_clean_submission_copy(win)
+        ).pack(side=tk.LEFT, padx=3)
+        help_button(
+            action_bar, "投稿干净版",
+            "另存一份文档，把 Lazybones 智能内容控件转换成普通文字并删除"
+            "隐藏标记；不会覆盖正在编辑的原稿。生成后仍建议运行 Word 的"
+            "“检查文档”。"
+        ).pack(side=tk.LEFT, padx=2)
+
+        default_scheme_id = schemes_payload.get(
+            "default_scheme_id", DEFAULT_SCHEME["id"])
+        refresh_scheme_combo(default_scheme_id)
+        refresh_order_tree(0)
+
     # ════════════════════════════════════════════════════
     # AI 对话
     # ════════════════════════════════════════════════════
@@ -4067,11 +6408,11 @@ class App(TkinterDnD.Tk):
 
     def _open_single_chat(self):
         """单篇深聊:要求先在管理页选中一行"""
-        sel = self.manage_tree.selection()
-        if not sel:
+        selected_ids = self._selected_manage_ids()
+        if not selected_ids:
             messagebox.showwarning("提示", "请先在表格中选中一篇文献")
             return
-        full_id = self.manage_tree.item(sel[0], "values")[1]
+        full_id = selected_ids[0]
         base_paper_id = full_id.rsplit("__", 1)[0]
 
         context, display_id = self._build_single_paper_context(
@@ -4184,23 +6525,8 @@ class App(TkinterDnD.Tk):
             if s in seq_to_base:
                 target_bases.add(seq_to_base[s])
 
-        # 在 tree 里高亮所有命中行(同一 base 的 zh/en 都选中)
-        matched_items = []
-        for item in self.manage_tree.get_children():
-            full_id = self.manage_tree.item(item, "values")[1]   # paper_id 在 index=1
-            base = full_id.rsplit("__", 1)[0]
-            if base in target_bases:
-                matched_items.append(item)
-
-        self.manage_tree.selection_set(matched_items)
-        if matched_items:
-            self.manage_tree.see(matched_items[0])
-        self._update_sel_count()
-
-        matched_bases = set()
-        for it in matched_items:
-            full_id = self.manage_tree.item(it, "values")[1]
-            matched_bases.add(full_id.rsplit("__", 1)[0])
+        # 命中项可能分布在多页；跨页选中并自动跳到第一个命中页。
+        matched_bases = self._select_manage_base_ids(target_bases)
         miss = [h for h in hits
                 if h not in matched_bases
                 and not (h.startswith("#")
@@ -4282,6 +6608,63 @@ class App(TkinterDnD.Tk):
 
     def _build_settings_tab(self):
         frame = self._make_scrollable(self.tab_settings)
+
+        appearance = normalize_appearance(self.settings)
+        appearance_frame = ttk.LabelFrame(
+            frame, text="外观与皮肤", padding=10)
+        appearance_frame.pack(fill=tk.X, padx=8, pady=8)
+
+        ttk.Label(appearance_frame, text="主题:").grid(
+            row=0, column=0, sticky=tk.W, pady=4)
+        self.theme_var = tk.StringVar(value=THEME_LABELS[
+            appearance["theme"]])
+        theme_combo = ttk.Combobox(
+            appearance_frame, textvariable=self.theme_var,
+            values=list(THEME_LABELS.values()), width=20, state="readonly")
+        theme_combo.grid(row=0, column=1, sticky=tk.W, padx=4)
+        theme_combo.bind("<<ComboboxSelected>>", self._preview_theme)
+
+        ttk.Label(appearance_frame, text="字体大小:").grid(
+            row=0, column=2, sticky=tk.W, padx=(18, 0), pady=4)
+        self.font_scale_var = tk.StringVar(
+            value=str(appearance["font_scale"]) + "%")
+        font_combo = ttk.Combobox(
+            appearance_frame, textvariable=self.font_scale_var,
+            values=["90%", "100%", "110%", "125%"],
+            width=10, state="readonly")
+        font_combo.grid(row=0, column=3, sticky=tk.W, padx=4)
+        font_combo.bind("<<ComboboxSelected>>", self._preview_theme)
+
+        ttk.Label(appearance_frame, text="界面密度:").grid(
+            row=0, column=4, sticky=tk.W, padx=(18, 0), pady=4)
+        self.ui_density_var = tk.StringVar(value=DENSITY_LABELS[
+            appearance["ui_density"]])
+        density_combo = ttk.Combobox(
+            appearance_frame, textvariable=self.ui_density_var,
+            values=list(DENSITY_LABELS.values()), width=10,
+            state="readonly")
+        density_combo.grid(row=0, column=5, sticky=tk.W, padx=4)
+        density_combo.bind("<<ComboboxSelected>>", self._preview_theme)
+
+        ttk.Button(appearance_frame, text="恢复经典外观",
+                   command=self._reset_theme_preview).grid(
+                       row=0, column=6, sticky=tk.W, padx=(18, 4))
+        self.appearance_status_var = tk.StringVar()
+        appearance_status = tk.Label(
+            appearance_frame, textvariable=self.appearance_status_var,
+            anchor=tk.W)
+        appearance_status._theme_role = "muted"
+        appearance_status.grid(
+            row=1, column=0, columnspan=7, sticky=tk.W, pady=(6, 2))
+        appearance_hint = tk.Label(
+            appearance_frame,
+            text="选择后立即预览；点击页面下方“保存设置”后永久生效。"
+                 "主题只改变显示，不修改文献和数据库。",
+            anchor=tk.W)
+        appearance_hint._theme_role = "muted"
+        appearance_hint.grid(
+            row=2, column=0, columnspan=7, sticky=tk.W, pady=(0, 2))
+        self._update_appearance_status()
 
         api_frame = ttk.LabelFrame(frame, text="API 配置", padding=10)
         api_frame.pack(fill=tk.X, padx=8, pady=8)
@@ -4381,6 +6764,80 @@ class App(TkinterDnD.Tk):
                   text="(估算超过会截断,DeepSeek 建议 ≤ 60000)",
                   foreground="#666").grid(row=3, column=2, sticky=tk.W)
 
+        perf_frame = ttk.LabelFrame(
+            frame, text="电脑性能与 GPU 加速", padding=10)
+        perf_frame.pack(fill=tk.X, padx=8, pady=8)
+
+        ttk.Label(perf_frame, text="性能模式:").grid(
+            row=0, column=0, sticky=tk.W, pady=4)
+        mode_id = self.settings.get("performance_mode", "balanced")
+        self.performance_mode_var = tk.StringVar(
+            value=MODE_LABELS.get(mode_id, MODE_LABELS["balanced"]))
+        mode_combo = ttk.Combobox(
+            perf_frame, textvariable=self.performance_mode_var,
+            values=list(MODE_LABELS.values()), width=18, state="readonly")
+        mode_combo.grid(row=0, column=1, sticky=tk.W, padx=4)
+        mode_combo.bind("<<ComboboxSelected>>", self._on_performance_change)
+
+        self.hardware_status_var = tk.StringVar(
+            value=self.performance_manager.hardware_summary())
+        ttk.Label(perf_frame, textvariable=self.hardware_status_var,
+                  foreground="#1F4E79", wraplength=850).grid(
+                      row=1, column=0, columnspan=6, sticky=tk.W, pady=3)
+        self.performance_summary_var = tk.StringVar(
+            value=self.performance_manager.budget_summary())
+        ttk.Label(perf_frame, textvariable=self.performance_summary_var,
+                  foreground="#356B45", wraplength=850).grid(
+                      row=2, column=0, columnspan=6, sticky=tk.W, pady=3)
+
+        custom_specs = [
+            ("文档进程", "custom_cpu_workers", 2),
+            ("AI 并发", "custom_ai_workers", 3),
+            ("同时任务", "custom_active_documents", 3),
+            ("内存上限 %", "memory_limit_percent", 75),
+            ("OCR DPI", "ocr_dpi", 190),
+        ]
+        self.performance_custom_entries = []
+        self.performance_custom_vars = {}
+        for index, (label, key, default) in enumerate(custom_specs):
+            column = (index % 3) * 2
+            row = 3 + index // 3
+            ttk.Label(perf_frame, text=label + ":").grid(
+                row=row, column=column, sticky=tk.W, pady=4)
+            variable = tk.IntVar(value=self.settings.get(key, default))
+            self.performance_custom_vars[key] = variable
+            entry = ttk.Entry(perf_frame, textvariable=variable, width=8)
+            entry.grid(row=row, column=column + 1, sticky=tk.W, padx=4)
+            entry.bind("<FocusOut>", self._on_performance_change)
+            self.performance_custom_entries.append(entry)
+
+        ttk.Label(perf_frame, text="GPU 模式:").grid(
+            row=5, column=0, sticky=tk.W, pady=4)
+        gpu_labels = {"auto": "自动（推荐）", "off": "关闭",
+                      "force": "强制使用"}
+        self.gpu_mode_var = tk.StringVar(value=gpu_labels.get(
+            self.settings.get("gpu_mode", "auto"), "自动（推荐）"))
+        gpu_combo = ttk.Combobox(
+            perf_frame, textvariable=self.gpu_mode_var,
+            values=list(gpu_labels.values()), width=18, state="readonly")
+        gpu_combo.grid(row=5, column=1, sticky=tk.W, padx=4)
+        gpu_combo.bind("<<ComboboxSelected>>", self._on_performance_change)
+        self.gpu_ocr_var = tk.BooleanVar(
+            value=self.settings.get("gpu_ocr_enabled", True))
+        ttk.Checkbutton(
+            perf_frame, text="扫描 PDF 优先使用 GPU OCR",
+            variable=self.gpu_ocr_var,
+            command=self._on_performance_change).grid(
+                row=5, column=2, columnspan=2, sticky=tk.W, padx=6)
+        ttk.Button(perf_frame, text="重新检测并自检 GPU",
+                   command=self._run_gpu_self_test).grid(
+                       row=5, column=4, columnspan=2, sticky=tk.W, padx=4)
+        self.gpu_test_result_var = tk.StringVar(value="")
+        ttk.Label(perf_frame, textvariable=self.gpu_test_result_var,
+                  foreground="#1F4E79", wraplength=850).grid(
+                      row=6, column=0, columnspan=6, sticky=tk.W, pady=3)
+        self._on_performance_change()
+
         path_frame = ttk.LabelFrame(frame, text="项目路径", padding=10)
         path_frame.pack(fill=tk.X, padx=8, pady=8)
 
@@ -4407,6 +6864,35 @@ class App(TkinterDnD.Tk):
                    command=self._open_config_dir
                    ).pack(side=tk.LEFT, padx=4)
 
+        update_frame = ttk.LabelFrame(frame, text="软件更新", padding=10)
+        update_frame.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Label(
+            update_frame, text="当前版本：v" + APP_VERSION,
+            font=("微软雅黑", 9, "bold")
+        ).grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.auto_update_var = tk.BooleanVar(
+            value=self.settings.get("auto_update_check", True))
+        ttk.Checkbutton(
+            update_frame, text="启动后自动检查 GitHub Release 更新",
+            variable=self.auto_update_var
+        ).grid(row=0, column=1, sticky=tk.W, padx=12)
+        ttk.Button(
+            update_frame, text="检查更新",
+            command=lambda: self._check_for_updates(manual=True)
+        ).grid(row=0, column=2, sticky=tk.W, padx=4)
+        ttk.Button(
+            update_frame, text="打开发布页",
+            command=lambda: webbrowser.open(GITHUB_RELEASES_URL)
+        ).grid(row=0, column=3, sticky=tk.W, padx=4)
+        self.update_status_var = tk.StringVar(
+            value="便携版更新只替换程序文件，不修改数据库和设置。")
+        update_status = tk.Label(
+            update_frame, textvariable=self.update_status_var,
+            anchor=tk.W, justify=tk.LEFT, wraplength=900)
+        update_status._theme_role = "muted"
+        update_status.grid(
+            row=1, column=0, columnspan=4, sticky=tk.W, pady=(4, 0))
+
         danger_frame = ttk.LabelFrame(frame, text="危险操作", padding=10)
         danger_frame.pack(fill=tk.X, padx=8, pady=8)
 
@@ -4415,17 +6901,21 @@ class App(TkinterDnD.Tk):
         btn_danger = ttk.Frame(danger_frame)
         btn_danger.pack(fill=tk.X, pady=4)
         ttk.Button(btn_danger, text="🗑 清空全部缓存",
-                   command=self._clear_all_cache
+                   command=self._clear_all_cache,
+                   style="Danger.TButton"
                    ).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_danger, text="🗑 清空当前数据库",
-                   command=self._clear_database
+                   command=self._clear_database,
+                   style="Danger.TButton"
                    ).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_danger, text="🗑 完全重置",
-                   command=self._full_reset
+                   command=self._full_reset,
+                   style="Danger.TButton"
                    ).pack(side=tk.LEFT, padx=4)
 
         ttk.Button(frame, text="💾 保存设置",
-                   command=self._save_settings).pack(pady=10)
+                   command=self._save_settings,
+                   style="Accent.TButton").pack(pady=10)
 
         # 数据备份区块
         backup_frame = ttk.LabelFrame(frame, text="数据备份", padding=10)
@@ -4453,6 +6943,231 @@ class App(TkinterDnD.Tk):
         ttk.Button(btn_db, text="📥 导入数据库",
                    command=self._import_database
                    ).pack(side=tk.LEFT, padx=4)
+
+    def _appearance_values_from_ui(self):
+        try:
+            font_scale = int(self.font_scale_var.get().rstrip("%"))
+        except (ValueError, tk.TclError):
+            font_scale = 100
+        return normalize_appearance({
+            "theme": THEME_IDS_BY_LABEL.get(
+                self.theme_var.get(), "classic"),
+            "font_scale": font_scale,
+            "ui_density": DENSITY_IDS_BY_LABEL.get(
+                self.ui_density_var.get(), "comfortable"),
+        })
+
+    def _preview_theme(self, event=None):
+        preview = dict(self.settings)
+        preview.update(self._appearance_values_from_ui())
+        self.theme_manager.apply(preview)
+        self._update_appearance_status()
+
+    def _reset_theme_preview(self):
+        self.theme_var.set(THEME_LABELS["classic"])
+        self.font_scale_var.set("100%")
+        self.ui_density_var.set(DENSITY_LABELS["comfortable"])
+        self._preview_theme()
+
+    def _update_appearance_status(self):
+        if not hasattr(self, "appearance_status_var"):
+            return
+        selected = THEME_IDS_BY_LABEL.get(
+            self.theme_var.get(), "classic")
+        if selected == "system":
+            resolved_label = THEME_LABELS.get(
+                self.theme_manager.resolved_theme, "浅色")
+            text = "跟随 Windows；当前实际使用：" + resolved_label
+        else:
+            text = "当前预览：" + THEME_LABELS.get(selected, "经典")
+        if selected == "speed":
+            text += " · 使用轻量原生控件，减少界面绘制开销"
+        text += (" · 字体 " + self.font_scale_var.get() + " · " +
+                 self.ui_density_var.get())
+        self.appearance_status_var.set(text)
+
+    # ── GitHub Release 自动更新 ────────────────────────
+
+    def _auto_check_for_updates(self):
+        """Quiet daily startup check for packaged portable builds."""
+        if not getattr(sys, "frozen", False):
+            return
+        if not self.settings.get("auto_update_check", True):
+            return
+        try:
+            last_check = float(self.settings.get("last_update_check", 0))
+        except (TypeError, ValueError):
+            last_check = 0
+        if time.time() - last_check < 24 * 60 * 60:
+            return
+        self._check_for_updates(manual=False)
+
+    def _check_for_updates(self, manual=False):
+        if getattr(self, "_update_checking", False):
+            if manual:
+                messagebox.showinfo("软件更新", "正在检查，请稍候。")
+            return
+        self._update_checking = True
+        if hasattr(self, "update_status_var"):
+            self.update_status_var.set("正在连接 GitHub 检查更新……")
+
+        def worker():
+            try:
+                info = check_latest_release(APP_VERSION)
+                error = None
+            except Exception as exc:
+                info = None
+                error = exc
+            self.after(
+                0, lambda: self._finish_update_check(info, error, manual))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update_check(self, info, error, manual):
+        self._update_checking = False
+        self.settings["last_update_check"] = int(time.time())
+        save_settings(self.settings)
+        if error is not None:
+            text = str(error)
+            if hasattr(self, "update_status_var"):
+                self.update_status_var.set("检查失败：" + text)
+            if manual:
+                messagebox.showerror("检查更新失败", text)
+            return
+        if info is None:
+            text = "当前已是最新版本，或仓库尚未发布正式 Release。"
+            if hasattr(self, "update_status_var"):
+                self.update_status_var.set(text)
+            if manual:
+                messagebox.showinfo("软件更新", text)
+            return
+
+        if hasattr(self, "update_status_var"):
+            self.update_status_var.set(
+                "发现新版本 v" + info.version + "：" + info.title)
+        notes = info.notes.strip()
+        if len(notes) > 1200:
+            notes = notes[:1200] + "……"
+        prompt = (
+            "发现 Lazybones v" + info.version + chr(10) + chr(10) +
+            (notes + chr(10) + chr(10) if notes else "") +
+            "是否下载并安装？" + chr(10) +
+            "更新前会备份现有程序文件，数据库和设置不会被修改。"
+        )
+        if not getattr(sys, "frozen", False):
+            if messagebox.askyesno(
+                    "发现新版本", prompt + chr(10) + chr(10) +
+                    "当前是源码运行模式，只能打开发布页手动下载。"):
+                webbrowser.open(info.release_url)
+            return
+        if messagebox.askyesno("发现新版本", prompt):
+            self._download_and_install_update(info)
+
+    def _download_and_install_update(self, info):
+        if hasattr(self, "update_status_var"):
+            self.update_status_var.set(
+                "正在下载 " + info.asset_name + "……")
+
+        def progress(downloaded, total):
+            if total > 0:
+                percent = min(100, round(downloaded * 100 / total))
+                text = "正在下载更新：" + str(percent) + "%"
+            else:
+                text = "正在下载更新：" + str(downloaded // 1024 // 1024) + " MB"
+            self.after(0, lambda value=text: self.update_status_var.set(value))
+
+        def worker():
+            try:
+                package = download_update(info, updates_dir(), progress)
+                error = None
+            except Exception as exc:
+                package = None
+                error = exc
+            self.after(
+                0, lambda: self._finish_update_download(
+                    info, package, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update_download(self, info, package, error):
+        if error is not None:
+            text = str(error)
+            self.update_status_var.set("下载失败：" + text)
+            messagebox.showerror("更新失败", text)
+            return
+        try:
+            launch_portable_updater(package, info)
+        except (OSError, UpdateError) as exc:
+            self.update_status_var.set("无法启动更新器：" + str(exc))
+            messagebox.showerror("更新失败", str(exc))
+            return
+        self.update_status_var.set("更新器已启动，程序即将关闭并自动重启。")
+        self.after(250, self.destroy)
+
+    def _performance_values_from_ui(self):
+        gpu_ids = {"自动（推荐）": "auto", "关闭": "off",
+                   "强制使用": "force"}
+        values = {
+            "performance_mode": MODE_IDS_BY_LABEL.get(
+                self.performance_mode_var.get(), "balanced"),
+            "gpu_mode": gpu_ids.get(self.gpu_mode_var.get(), "auto"),
+            "gpu_ocr_enabled": bool(self.gpu_ocr_var.get()),
+        }
+        defaults = {
+            "custom_cpu_workers": 2,
+            "custom_ai_workers": 3,
+            "custom_active_documents": 3,
+            "memory_limit_percent": 75,
+            "ocr_dpi": 190,
+        }
+        for key, variable in self.performance_custom_vars.items():
+            try:
+                values[key] = variable.get()
+            except tk.TclError:
+                values[key] = defaults[key]
+        return values
+
+    def _on_performance_change(self, event=None):
+        if not hasattr(self, "performance_custom_vars"):
+            return
+        values = self._performance_values_from_ui()
+        preview = dict(self.settings)
+        preview.update(values)
+        budget = self.performance_manager.refresh(preview)
+        custom = values["performance_mode"] == "custom"
+        state = tk.NORMAL if custom else tk.DISABLED
+        for entry in self.performance_custom_entries:
+            entry.configure(state=state)
+        self.performance_summary_var.set(
+            self.performance_manager.budget_summary())
+
+    def _run_gpu_self_test(self):
+        self.gpu_test_result_var.set("正在重新检测 GPU 并运行 OCR 自检…")
+        values = self._performance_values_from_ui()
+        preview = dict(self.settings)
+        preview.update(values)
+        self.performance_manager.refresh(preview, redetect=True)
+        self.hardware_status_var.set(
+            self.performance_manager.hardware_summary())
+        prefer_gpu = (
+            self.performance_manager.resources.gpu.directml_available)
+
+        def worker():
+            from gpu_acceleration import clear_engine_cache, self_test
+            clear_engine_cache()
+            result = self_test(prefer_gpu=prefer_gpu)
+
+            def finish():
+                prefix = "✓ " if result["ok"] else "✗ "
+                detail = result["message"]
+                if result.get("recognized"):
+                    detail += "；识别结果：" + result["recognized"][:100]
+                self.gpu_test_result_var.set(prefix + detail)
+                self._on_performance_change()
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── API / 模型 ────────────────────────────────
 
@@ -4483,7 +7198,7 @@ class App(TkinterDnD.Tk):
                 self.api_key_var.get(),
                 self.model_var.get())
             prefix = "✓ " if success else "✗ "
-            self.test_result_var.set(prefix + msg)
+            self.after(0, lambda: self.test_result_var.set(prefix + msg))
 
         threading.Thread(target=_do_test, daemon=True).start()
 
@@ -4613,6 +7328,8 @@ class App(TkinterDnD.Tk):
     # ── 设置保存 / UI 同步 ────────────────────────
 
     def _save_settings(self):
+        appearance_values = self._appearance_values_from_ui()
+        performance_values = self._performance_values_from_ui()
         self.settings.update({
             "provider": self.provider_var.get(),
             "api_key": self.api_key_var.get(),
@@ -4626,6 +7343,12 @@ class App(TkinterDnD.Tk):
                         if hasattr(self, "lang_en_var") else True),
             "schema_version": (self.schema_var.get()
                                if hasattr(self, "schema_var") else ""),
+            "auto_confirm_clean_pairs": (
+                self.auto_confirm_pairs_var.get()
+                if hasattr(self, "auto_confirm_pairs_var") else True),
+            "auto_open_review": (
+                self.auto_open_review_var.get()
+                if hasattr(self, "auto_open_review_var") else True),
             "ai_timeout": (self.ai_timeout_var.get()
                            if hasattr(self, "ai_timeout_var") else 600),
             "ai_max_retries": (self.ai_retries_var.get()
@@ -4633,8 +7356,17 @@ class App(TkinterDnD.Tk):
             "max_input_tokens": (self.max_input_tokens_var.get()
                                  if hasattr(self, "max_input_tokens_var")
                                  else 100000),
+            "auto_update_check": (
+                self.auto_update_var.get()
+                if hasattr(self, "auto_update_var") else True),
         })
+        self.settings.update(appearance_values)
+        self.settings.update(performance_values)
+        budget = self.performance_manager.refresh(self.settings)
+        # Preserve the old key for older releases/config exports.
+        self.settings["concurrent"] = budget.ai_workers
         save_settings(self.settings)
+        self.theme_manager.apply(self.settings)
         self._ensure_project_dirs()
         self._init_db()
         messagebox.showinfo("已保存", "设置已保存")
@@ -4650,6 +7382,24 @@ class App(TkinterDnD.Tk):
         self.model_var.set(self.settings.get("model", ""))
         self.max_chars_var.set(self.settings.get("max_chars", 80000))
         self.proj_dir_var.set(self.settings.get("project_dir", ""))
+        if hasattr(self, "theme_var"):
+            appearance = normalize_appearance(self.settings)
+            self.theme_var.set(THEME_LABELS[appearance["theme"]])
+            self.font_scale_var.set(str(appearance["font_scale"]) + "%")
+            self.ui_density_var.set(
+                DENSITY_LABELS[appearance["ui_density"]])
+            self.theme_manager.apply(self.settings)
+            self._update_appearance_status()
+        if hasattr(self, "lang_zh_var"):
+            self.lang_zh_var.set(self.settings.get("lang_zh", True))
+        if hasattr(self, "lang_en_var"):
+            self.lang_en_var.set(self.settings.get("lang_en", True))
+        if hasattr(self, "auto_confirm_pairs_var"):
+            self.auto_confirm_pairs_var.set(
+                self.settings.get("auto_confirm_clean_pairs", True))
+        if hasattr(self, "auto_open_review_var"):
+            self.auto_open_review_var.set(
+                self.settings.get("auto_open_review", True))
         # 同步新增的 3 个参数(用 hasattr 守护,兼容旧版 settings.json)
         if hasattr(self, "ai_timeout_var"):
             self.ai_timeout_var.set(self.settings.get("ai_timeout", 600))
@@ -4659,6 +7409,32 @@ class App(TkinterDnD.Tk):
         if hasattr(self, "max_input_tokens_var"):
             self.max_input_tokens_var.set(
                 self.settings.get("max_input_tokens", 100000))
+        if hasattr(self, "auto_update_var"):
+            self.auto_update_var.set(
+                self.settings.get("auto_update_check", True))
+        if hasattr(self, "performance_mode_var"):
+            mode = self.settings.get("performance_mode", "balanced")
+            self.performance_mode_var.set(
+                MODE_LABELS.get(mode, MODE_LABELS["balanced"]))
+            gpu_labels = {"auto": "自动（推荐）", "off": "关闭",
+                          "force": "强制使用"}
+            self.gpu_mode_var.set(gpu_labels.get(
+                self.settings.get("gpu_mode", "auto"), "自动（推荐）"))
+            self.gpu_ocr_var.set(
+                self.settings.get("gpu_ocr_enabled", True))
+            defaults = {
+                "custom_cpu_workers": 2,
+                "custom_ai_workers": 3,
+                "custom_active_documents": 3,
+                "memory_limit_percent": 75,
+                "ocr_dpi": 190,
+            }
+            for key, variable in self.performance_custom_vars.items():
+                variable.set(self.settings.get(key, defaults[key]))
+            self.performance_manager.refresh(self.settings)
+            self.hardware_status_var.set(
+                self.performance_manager.hardware_summary())
+            self._on_performance_change()
         self._update_model_list()
 
     # ── 危险操作 ───────────────────────────────────

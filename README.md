@@ -59,6 +59,16 @@ Lazybones is domain-agnostic. Any field with a well-written YAML schema is suppo
 
 ## 🚀 快速开始 / Quick Start
 
+### 免安装便携版 / Portable Release
+
+从 GitHub Releases 下载 `Lazybones-vX.Y.Z-portable-win64.zip`，解压到普通文件夹后双击 `Lazybones.exe`。不要直接在 ZIP 压缩包内运行。
+
+便携版不要求单独安装 Python。数据库、配置、缓存与引用方案保存在 `%APPDATA%\Lazybones`，因此替换或升级程序目录不会覆盖用户数据。
+
+软件启动后每天至多检查一次 GitHub 正式 Release。发现新版时会先征求确认，再下载完整便携包、校验 SHA-256、备份当前程序文件，并由独立更新器完成替换；失败时自动回滚。也可以在“设置 → 软件更新”中关闭自动检查或手动检查。
+
+维护者发布新版本时，应同步修改 `src/version.py` 中的 `APP_VERSION`，并推送同名标签（如 `v1.4.0`）。GitHub Actions 会自动测试、构建并上传 ZIP 与校验文件。
+
 ### 环境要求 / Requirements
 
 - Windows 10 / 11（64 位）

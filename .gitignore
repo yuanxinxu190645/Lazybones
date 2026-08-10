@@ -10,6 +10,8 @@ env/
 build/
 dist/
 installer_output/
+dist-tools/
+release/
 
 # ─── 本地配置（含 API Key，严禁上传）───
 config/
@@ -19,10 +21,8 @@ project/
 *.db
 
 # ─── 私有提示词（只发布通用版 v1.0_basic.yaml）───
-prompts/v2.0_*.yaml
-prompts/v3.*_*.yaml
-prompts/v4.*_*.yaml
-prompts/v5.*_*.yaml
+prompts/*.yaml
+!prompts/v1.0_basic.yaml
 
 # ─── 临时文件 ───
 code_bundle.json
