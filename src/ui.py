@@ -62,6 +62,8 @@ from update_manager import (UpdateError, check_latest_release,
                             download_update, launch_portable_updater,
                             updates_dir)
 from version import APP_VERSION, GITHUB_RELEASES_URL
+from ui_rendering import bind_canvas_form, stabilize_scrolled_text
+from ai_bundle_ui import AIBundlePage
 NL = chr(10)
 NL2 = chr(10) + chr(10)
 
@@ -121,24 +123,9 @@ class App(TkinterDnD.Tk):
 
     # ── AI 按钮工厂 ────────────────────────────────────
     def _ai_button(self, parent, text, command, **kwargs):
-        """创建带茶绿色标识的 AI 功能按钮"""
-        btn = tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg="#A8D5B5",
-            fg="#1A3A2A",
-            activebackground="#7EC8A0",
-            activeforeground="#1A3A2A",
-            relief=tk.FLAT,
-            padx=6,
-            pady=2,
-            font=("微软雅黑", 9),
-            cursor="hand2",
-            **kwargs
-        )
-        btn._theme_role = "accent"
-        return btn
+        """Use the same themed, keyboard-focusable controls for AI actions."""
+        return ttk.Button(parent, text=text, command=command,
+                          style="Accent.TButton", cursor="hand2", **kwargs)
 
     def _on_theme_widget_map(self, event):
         widget = getattr(event, "widget", None)
@@ -176,30 +163,97 @@ class App(TkinterDnD.Tk):
             self.after(2500, self._poll_system_theme)
 
     def _build_ui(self):
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        header = ttk.Frame(self, style="Shell.TFrame", padding=(20, 12, 20, 8))
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="Lazybones", style="Brand.TLabel").pack(
+            side=tk.LEFT)
+        self.workspace_hint = tk.StringVar(value="导入文献，开始整理你的研究资料")
+        ttk.Label(header, textvariable=self.workspace_hint,
+                  style="Shell.TLabel").pack(side=tk.LEFT, padx=18)
+        self.settings_button = ttk.Button(header, text="设置", command=self._show_settings)
+        self.settings_button.pack(side=tk.RIGHT, padx=(12, 0))
+        ttk.Label(header, text=f"文献工作台  /  {APP_VERSION}",
+                  style="Shell.TLabel").pack(side=tk.RIGHT)
+
+        self.status_var = tk.StringVar(value="就绪")
+        status_bar = tk.Label(self, textvariable=self.status_var,
+                              bd=0, relief=tk.FLAT, anchor=tk.W,
+                              padx=20, pady=5)
+        status_bar._theme_role = "status"
+        # Reserve this before the expanding workspace, including on short screens.
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.workspace_container = ttk.Frame(self, style="Shell.TFrame")
+        self.workspace_container.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 6))
+        self.workspace_container.rowconfigure(0, weight=1)
+        self.workspace_container.columnconfigure(0, weight=1)
+        self._settings_visible = False
+        self.main_notebook = ttk.Notebook(self.workspace_container)
+        self.main_notebook.grid(row=0, column=0, sticky="nsew")
+        self.tab_database = ttk.Frame(self.main_notebook, padding=(6, 8, 6, 0))
+        self.main_notebook.add(self.tab_database, text="数据库建立")
+        self.notebook = ttk.Notebook(self.tab_database)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
 
         self.tab_extract = ttk.Frame(self.notebook)
         self.tab_review = ttk.Frame(self.notebook)
         self.tab_manage = ttk.Frame(self.notebook)
-        self.tab_settings = ttk.Frame(self.notebook)
+        self.tab_ai_bundle = AIBundlePage(self.main_notebook, self)
 
-        self.notebook.add(self.tab_extract,  text="  📥 抽取  ")
-        self.notebook.add(self.tab_review,   text="  🔍 审核  ")
-        self.notebook.add(self.tab_manage,   text="  🗄 数据管理  ")
-        self.notebook.add(self.tab_settings, text="  ⚙ 设置  ")
+        self.notebook.add(self.tab_extract,  text="文献抽取")
+        self.notebook.add(self.tab_review,   text="内容审核")
+        self.notebook.add(self.tab_manage,   text="数据管理")
+        self.main_notebook.add(self.tab_ai_bundle, text="AI 资料包")
+        self.notebook.bind("<<NotebookTabChanged>>", self._update_workspace_hint)
+        self.main_notebook.bind("<<NotebookTabChanged>>", self._update_workspace_hint)
+
+        self.settings_view = ttk.Frame(self.workspace_container)
+        self.settings_view.grid(row=0, column=0, sticky="nsew")
+        settings_header = ttk.Frame(self.settings_view, padding=(10, 8))
+        settings_header.pack(fill=tk.X)
+        ttk.Button(settings_header, text="← 返回工作台",
+                   command=self._show_workspace).pack(side=tk.LEFT)
+        ttk.Label(settings_header, text="偏好设置", style="PageTitle.TLabel").pack(side=tk.LEFT, padx=16)
+        self.tab_settings = ttk.Frame(self.settings_view)
+        self.tab_settings.pack(fill=tk.BOTH, expand=True)
 
         self._build_extract_tab()
         self._build_review_tab()
         self._build_manage_tab()
         self._build_settings_tab()
+        self._show_workspace()
 
-        self.status_var = tk.StringVar(value="就绪")
-        status_bar = tk.Label(self, textvariable=self.status_var,
-                              bd=1, relief=tk.SUNKEN, anchor=tk.W,
-                              bg="#E0E0E0", padx=8)
-        status_bar._theme_role = "status"
-        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+    def _show_settings(self):
+        self._settings_visible = True
+        self.settings_view.tkraise()
+        self.settings_button.configure(style="Accent.TButton")
+        self._update_workspace_hint()
+
+    def _show_workspace(self):
+        self._settings_visible = False
+        self.main_notebook.tkraise()
+        self.settings_button.configure(style="TButton")
+        self._update_workspace_hint()
+
+    def _select_database_tab(self, tab):
+        """Programmatic navigation must activate both notebook levels."""
+        self.main_notebook.select(self.tab_database)
+        self.notebook.select(tab)
+        self._show_workspace()
+
+    def _update_workspace_hint(self, event=None):
+        if self._settings_visible:
+            self.workspace_hint.set("按你的习惯调整工作台")
+            return
+        if self.main_notebook.select() == str(self.tab_ai_bundle):
+            self.workspace_hint.set("把原文转成可追溯、可分包的 AI 阅读资料")
+            return
+        hints = (
+            "导入文献，开始整理你的研究资料",
+            "核对抽取结果，将可靠的内容收录入库",
+            "检索、整理与引用你的研究资料",
+        )
+        self.workspace_hint.set(hints[self.notebook.index("current")])
 
     # ════════════════════════════════════════════════════
     # 抽取页
@@ -208,41 +262,44 @@ class App(TkinterDnD.Tk):
     def _build_extract_tab(self):
         frame = self.tab_extract
 
-        left = ttk.LabelFrame(frame, text="文件队列", padding=6)
+        left = ttk.LabelFrame(frame, text="待处理文件", padding=12)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=8, pady=8)
 
         self.tip_label = tk.Label(
             left,
-            text="拖放文件到此窗口或点击下方按钮选择",
+            text="将文献拖到这里\n或选择电脑中的文件",
             fg="#0070C0", font=("微软雅黑", 9, "bold"),
             justify=tk.LEFT)
         self.tip_label._theme_role = "accent"
-        self.tip_label.pack(pady=4)
+        self.tip_label.pack(anchor=tk.W, pady=(6, 14))
 
         btn_frame = ttk.Frame(left)
         btn_frame.pack(fill=tk.X)
         ttk.Button(btn_frame, text="选择文件",
                    command=self._select_files).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="扫描inbox",
+        ttk.Button(btn_frame, text="扫描收件箱",
                    command=self._scan_inbox).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
         ttk.Label(left, text="待处理队列:").pack(anchor=tk.W)
 
-        self.queue_listbox = tk.Listbox(left, width=38, height=22,
+        self.queue_listbox = tk.Listbox(left, width=30, height=22,
                                         selectmode=tk.EXTENDED,
                                         font=("微软雅黑", 9))
         self.queue_listbox.pack(fill=tk.BOTH, expand=True, pady=4)
 
-        ttk.Button(left, text="移除选中",
-                   command=self._remove_from_queue).pack(pady=2)
-        ttk.Button(left, text="清空队列",
-                   command=self._clear_queue).pack(pady=2)
+        queue_actions = ttk.Frame(left)
+        queue_actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0),
+                           before=self.queue_listbox)
+        ttk.Button(queue_actions, text="移除选中",
+                   command=self._remove_from_queue).pack(side=tk.LEFT)
+        ttk.Button(queue_actions, text="清空队列",
+                   command=self._clear_queue).pack(side=tk.RIGHT)
 
         right = ttk.Frame(frame)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=8)
 
-        ctrl = ttk.LabelFrame(right, text="抽取控制", padding=8)
+        ctrl = ttk.LabelFrame(right, text="抽取选项", padding=12)
         ctrl.pack(fill=tk.X, padx=4, pady=4)
 
         row1 = ttk.Frame(ctrl)
@@ -291,9 +348,9 @@ class App(TkinterDnD.Tk):
                   foreground="#777").pack(side=tk.LEFT)
 
         btn_row = ttk.Frame(ctrl)
-        btn_row.pack(pady=6)
+        btn_row.pack(fill=tk.X, pady=(10, 2))
         self.start_btn = self._ai_button(
-            btn_row, text="▶ 开始抽取",
+            btn_row, text="开始抽取",
             command=self._start_extraction)
         self.start_btn.pack(side=tk.LEFT, padx=4)
         self.stop_btn = ttk.Button(btn_row, text="■ 停止",
@@ -306,13 +363,14 @@ class App(TkinterDnD.Tk):
                                             maximum=100)
         self.progress_bar.pack(fill=tk.X, padx=4, pady=4)
 
-        log_frame = ttk.LabelFrame(right, text="运行日志")
+        log_frame = ttk.LabelFrame(right, text="运行日志", padding=8)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self.log_text = scrolledtext.ScrolledText(
             log_frame, height=22, state=tk.DISABLED,
             font=("Consolas", 9), bg="#1E1E1E", fg="#D4D4D4")
         self.log_text._theme_role = "log"
         self.log_text.pack(fill=tk.BOTH, expand=True)
+        stabilize_scrolled_text(self.log_text)
 
         self.log_text.tag_config("time",   foreground="#6A9955")
         self.log_text.tag_config("ok",     foreground="#4EC9B0")
@@ -881,7 +939,7 @@ class App(TkinterDnD.Tk):
                 self._refresh_review_tab()
             if (self.settings.get("auto_open_review", True)
                     and success_count > 0):
-                self.notebook.select(self.tab_review)
+                self._select_database_tab(self.tab_review)
                 self.review_status_label._theme_role = "success"
                 self.theme_manager.apply_widget(self.review_status_label)
                 self.review_status_var.set(
@@ -1371,6 +1429,7 @@ class App(TkinterDnD.Tk):
         self.review_detail = scrolledtext.ScrolledText(
             right_frame, font=("微软雅黑", 9), wrap=tk.WORD)
         self.review_detail.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        stabilize_scrolled_text(self.review_detail)
         self.review_detail.tag_config("title", foreground="#1F4E79",
                                       font=("微软雅黑", 11, "bold"))
         self.review_detail.tag_config("identity_block",
@@ -1407,42 +1466,46 @@ class App(TkinterDnD.Tk):
         self._review_current_doi = ""
 
         btn_frame = ttk.Frame(right_frame)
-        btn_frame.pack(fill=tk.X, padx=4, pady=4)
-        ttk.Button(btn_frame, text="✓ 收录入库(当前)",
+        self.review_action_bar = btn_frame
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=6,
+                       before=self.review_detail.frame)
+        primary_actions = ttk.Frame(btn_frame)
+        primary_actions.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(primary_actions, text="收录当前",
                    command=self._accept_paper).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="✓ 收录并下一篇",
+        ttk.Button(primary_actions, text="收录并下一篇",
                    command=self._accept_and_next,
                    style="Accent.TButton").pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="✗ 丢弃(当前)",
+        ttk.Button(primary_actions, text="丢弃当前", style="Danger.TButton",
                    command=self._reject_paper).pack(side=tk.LEFT, padx=4)
-        ttk.Separator(btn_frame, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=6)
-        # 批量操作:基于勾选
-        ttk.Button(btn_frame, text="✓✓ 批量收录(已勾)",
-                   command=self._batch_accept_checked
-                   ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="✗✗ 批量丢弃(已勾)",
-                   command=self._batch_reject_checked
-                   ).pack(side=tk.LEFT, padx=4)
-        self._ai_button(btn_frame, text="↺ 重跑",
-                        command=self._rerun_paper).pack(side=tk.LEFT, padx=4)
+        ttk.Button(primary_actions, text="重新抽取",
+                   command=self._rerun_paper).pack(side=tk.LEFT, padx=4)
+        batch_button = ttk.Menubutton(primary_actions, text="批量处理")
+        batch_menu = tk.Menu(batch_button, tearoff=False)
+        batch_menu.add_command(label="收录已勾选文献", command=self._batch_accept_checked)
+        batch_menu.add_command(label="丢弃已勾选文献", command=self._batch_reject_checked)
+        batch_button.configure(menu=batch_menu)
+        batch_button.pack(side=tk.LEFT, padx=4)
+
+        navigation = ttk.Frame(btn_frame)
+        navigation.pack(fill=tk.X)
 
         # 重跑状态标签:常态隐藏,重跑时显示进度,完成后自动隐藏
         self.review_status_var = tk.StringVar(value="")
         self.review_status_label = tk.Label(
-            btn_frame, textvariable=self.review_status_var,
+            navigation, textvariable=self.review_status_var,
             fg="#0070C0", font=("微软雅黑", 9, "bold"))
         self.review_status_label._theme_role = "accent"
         self.review_status_label.pack(side=tk.LEFT, padx=12)
 
-        ttk.Button(btn_frame, text="📂 打开缓存目录",
+        ttk.Button(navigation, text="缓存目录",
                    command=self._open_cache_dir).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btn_frame, text="📋 复制 DOI",
+        ttk.Button(navigation, text="复制 DOI",
                    command=self._copy_review_doi).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btn_frame, text="下一篇 ▶",
+        ttk.Button(navigation, text="下一篇 →",
                    command=lambda: self._move_review_selection(1)
                    ).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(btn_frame, text="◀ 上一篇",
+        ttk.Button(navigation, text="← 上一篇",
                    command=lambda: self._move_review_selection(-1)
                    ).pack(side=tk.RIGHT, padx=2)
 
@@ -1616,7 +1679,9 @@ class App(TkinterDnD.Tk):
 
     def _review_tab_is_active(self):
         try:
-            return self.notebook.select() == str(self.tab_review)
+            return (not self._settings_visible
+                    and self.main_notebook.select() == str(self.tab_database)
+                    and self.notebook.select() == str(self.tab_review))
         except tk.TclError:
             return False
 
@@ -2142,54 +2207,50 @@ class App(TkinterDnD.Tk):
         top = ttk.Frame(frame)
         top.pack(fill=tk.X, padx=8, pady=4)
 
-        ttk.Label(top, text="当前数据库:",
-                  font=("微软雅黑", 9, "bold")
+        ttk.Label(top, text="文献库", style="PageTitle.TLabel"
                   ).pack(side=tk.LEFT, padx=(4, 0))
         self.db_name_var = tk.StringVar()
         self.db_combo = ttk.Combobox(top, textvariable=self.db_name_var,
                                      width=20, state="readonly")
         self.db_combo.pack(side=tk.LEFT, padx=4)
         self.db_combo.bind("<<ComboboxSelected>>", self._on_db_change)
-        ttk.Button(top, text="➕ 新建数据库",
+        ttk.Button(top, text="新建文献库",
                    command=lambda: self._create_new_db()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="🔄 刷新",
+        ttk.Button(top, text="刷新",
                    command=lambda: self._refresh_manage_tab()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Separator(top, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(top, text="📤 导出Excel(中)",
-                   command=lambda: self._export_excel("zh")
-                   ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="📤 导出Excel(英)",
-                   command=lambda: self._export_excel("en")
-                   ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="📝 导出Markdown(中)",
-                   command=lambda: self._export_markdown("zh")
-                   ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="📝 导出Markdown(英)",
-                   command=lambda: self._export_markdown("en")
-                   ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="📦 备份zip",
-                   command=lambda: self._export_zip()).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top, text="📥 导入zip",
-                   command=lambda: self._import_zip()).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="导入备份",
+                   command=self._import_zip).pack(side=tk.RIGHT, padx=4)
+        export_button = ttk.Menubutton(top, text="导出与备份")
+        export_menu = tk.Menu(export_button, tearoff=False)
+        for label, command in (
+            ("Excel · 中文", lambda: self._export_excel("zh")),
+            ("Excel · 英文", lambda: self._export_excel("en")),
+            ("Markdown · 中文", lambda: self._export_markdown("zh")),
+            ("Markdown · 英文", lambda: self._export_markdown("en")),
+        ):
+            export_menu.add_command(label=label, command=command)
+        export_menu.add_separator()
+        export_menu.add_command(label="完整数据库备份（ZIP）", command=self._export_zip)
+        export_button.configure(menu=export_menu)
+        export_button.pack(side=tk.RIGHT, padx=4)
 
 
 
         self.stats_label = tk.Label(frame, text="", fg="#1F4E79",
                                     font=("微软雅黑", 10, "bold"))
-        self.stats_label._theme_role = "accent"
-        self.stats_label.pack(pady=2)
+        self.stats_label._theme_role = "muted"
+        self.stats_label.pack(anchor=tk.W, padx=12, pady=(4, 8))
 
         filter_frame = ttk.Frame(frame)
         filter_frame.pack(fill=tk.X, padx=8, pady=2)
-        ttk.Label(filter_frame, text="筛选:").pack(side=tk.LEFT)
+        ttk.Label(filter_frame, text="搜索文献").pack(side=tk.LEFT)
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add(
             "write", lambda *a: self._schedule_filter())
         ttk.Entry(filter_frame, textvariable=self.filter_var,
-                  width=30).pack(side=tk.LEFT, padx=4)
+                  width=30).pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
         ttk.Label(filter_frame, text="字段:").pack(side=tk.LEFT, padx=(8, 2))
         self.filter_field_var = tk.StringVar(value="全部字段")
         self.filter_field_combo = ttk.Combobox(
@@ -2205,23 +2266,24 @@ class App(TkinterDnD.Tk):
         ttk.Button(filter_frame, text="清除",
                    command=lambda: self.filter_var.set("")
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Separator(filter_frame, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=8)
+        ai_filter_frame = ttk.Frame(frame)
+        ai_filter_frame.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ttk.Label(ai_filter_frame, text="智能查找").pack(side=tk.LEFT)
         self.ask_var = tk.StringVar()
-        ask_entry = ttk.Entry(filter_frame, textvariable=self.ask_var,
+        ask_entry = ttk.Entry(ai_filter_frame, textvariable=self.ask_var,
                               width=36)
-        ask_entry.pack(side=tk.LEFT, padx=4)
+        ask_entry.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
         ask_entry.bind("<Return>", lambda e: self._ask_ai_find_papers())
-        ttk.Label(filter_frame, text="返回:").pack(side=tk.LEFT, padx=(12, 2))
+        ttk.Label(ai_filter_frame, text="返回:").pack(side=tk.LEFT, padx=(12, 2))
         self.max_hits_var = tk.StringVar(value="20")
         max_hits_combo = ttk.Combobox(
-            filter_frame, textvariable=self.max_hits_var,
+            ai_filter_frame, textvariable=self.max_hits_var,
             values=["10", "20", "50", "100", "全部"],
             width=6)   # ← 注意:不加 state="readonly",允许手动输入任意数字
         max_hits_combo.pack(side=tk.LEFT)
-        ttk.Label(filter_frame, text="篇",
+        ttk.Label(ai_filter_frame, text="篇",
                   foreground="#888").pack(side=tk.LEFT)
-        self._ai_button(filter_frame, text="🔎 问 AI 找论文",
+        self._ai_button(ai_filter_frame, text="问 AI 找论文",
                        command=lambda: self._ask_ai_find_papers()
                        ).pack(side=tk.LEFT, padx=2)
 
@@ -2313,33 +2375,33 @@ class App(TkinterDnD.Tk):
         # This keeps the buttons visible on shorter screens and larger scaling.
         bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(2, 6),
                     before=tree_frame)
-        ttk.Button(bottom, text="❌ 删除选中",
+        ttk.Button(bottom, text="删除选中", style="Danger.TButton",
                    command=lambda: self._delete_selected_db()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text="👁 查看详情",
+        ttk.Button(bottom, text="查看详情",
                    command=lambda: self._view_db_detail()
                    ).pack(side=tk.LEFT, padx=4)
-        self._ai_button(bottom, text="↺ 重抽选中",
+        ttk.Button(bottom, text="重新抽取",
                         command=lambda: self._rerun_selected_db()
                         ).pack(side=tk.LEFT, padx=4)
 
-        self._ai_button(bottom, text="💬 单篇问 AI",
+        ttk.Button(bottom, text="单篇问 AI",
                         command=lambda: self._open_single_chat()
                         ).pack(side=tk.LEFT, padx=4)
 
-        self._ai_button(bottom, text="💬 打开AI对话",
+        ttk.Button(bottom, text="AI 对话",
                         command=lambda: self._open_chat_window()
                         ).pack(side=tk.LEFT, padx=12)
-        ttk.Button(bottom, text="📚 引用工具",
+        ttk.Button(bottom, text="引用工具", style="Accent.TButton",
                    command=lambda: self._open_citation_builder()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text="🔧 重命名ID",
+        ttk.Button(bottom, text="重命名",
                    command=lambda: self._rename_paper_id_dialog()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text="🧹 扫描重复",
+        ttk.Button(bottom, text="扫描重复",
                    command=lambda: self._scan_database_duplicates()
                    ).pack(side=tk.LEFT, padx=4)
-        ttk.Button(bottom, text="🔍 查找替换",
+        ttk.Button(bottom, text="查找替换",
                    command=lambda: self._find_replace_dialog()
                   ).pack(side=tk.LEFT, padx=4)
 
@@ -2968,6 +3030,7 @@ class App(TkinterDnD.Tk):
             left_frame, font=("微软雅黑", 9), wrap=tk.WORD,
             state=tk.NORMAL)
         render_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        stabilize_scrolled_text(render_text)
         render_text.bind("<Key>", self._readonly_text_key)
         self._install_readonly_copy_support(render_text)
 
@@ -3037,12 +3100,7 @@ class App(TkinterDnD.Tk):
         edit_inner = ttk.Frame(edit_canvas)
         edit_inner_id = edit_canvas.create_window(
             (0, 0), window=edit_inner, anchor=tk.NW)
-        edit_inner.bind("<Configure>",
-                        lambda e: edit_canvas.configure(
-                            scrollregion=edit_canvas.bbox("all")))
-        edit_canvas.bind("<Configure>",
-                         lambda e: edit_canvas.itemconfigure(
-                             edit_inner_id, width=e.width))
+        bind_canvas_form(edit_canvas, edit_inner, edit_inner_id, edit_vsb)
 
         save_btn_frame = ttk.Frame(right_frame)
 
@@ -4816,6 +4874,7 @@ class App(TkinterDnD.Tk):
             preview_box, wrap=tk.WORD,
             font=("Times New Roman", 10), padx=8, pady=8)
         preview_text.pack(fill=tk.BOTH, expand=True)
+        stabilize_scrolled_text(preview_text)
 
         action_bar = ttk.Frame(win, padding=(10, 0, 10, 10))
         action_bar.pack(side=tk.BOTTOM, fill=tk.X, before=pane)
@@ -6019,6 +6078,7 @@ class App(TkinterDnD.Tk):
             right, font=("微软雅黑", 10), wrap=tk.WORD,
             bg="#FAFAFA", state=tk.DISABLED)
         chat_display.pack(fill=tk.BOTH, expand=True, pady=4)
+        stabilize_scrolled_text(chat_display)
         chat_display.tag_config("user", foreground="#0070C0",
                                 font=("微软雅黑", 10, "bold"))
         chat_display.tag_config("ai", foreground="#1A1A1A",
@@ -6571,16 +6631,7 @@ class App(TkinterDnD.Tk):
         inner_id = canvas.create_window((0, 0), window=inner,
                                         anchor=tk.NW)
 
-        def _on_inner_config(event):
-            # 内部 frame 大小变化时,更新 canvas 的滚动区域
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _on_canvas_config(event):
-            # canvas 宽度变化时,同步内部 frame 宽度,避免出现横向空白
-            canvas.itemconfigure(inner_id, width=event.width)
-
-        inner.bind("<Configure>", _on_inner_config)
-        canvas.bind("<Configure>", _on_canvas_config)
+        bind_canvas_form(canvas, inner, inner_id, vsb)
 
         # 鼠标滚轮支持(Windows/macOS 通用)
         def _on_mousewheel(event):
@@ -6648,14 +6699,16 @@ class App(TkinterDnD.Tk):
 
         ttk.Button(appearance_frame, text="恢复经典外观",
                    command=self._reset_theme_preview).grid(
-                       row=0, column=6, sticky=tk.W, padx=(18, 4))
+                       row=1, column=0, columnspan=2, sticky=tk.W,
+                       pady=(10, 4))
         self.appearance_status_var = tk.StringVar()
         appearance_status = tk.Label(
             appearance_frame, textvariable=self.appearance_status_var,
             anchor=tk.W)
         appearance_status._theme_role = "muted"
         appearance_status.grid(
-            row=1, column=0, columnspan=7, sticky=tk.W, pady=(6, 2))
+            row=1, column=2, columnspan=4, sticky=tk.W,
+            padx=(18, 0), pady=(10, 4))
         appearance_hint = tk.Label(
             appearance_frame,
             text="选择后立即预览；点击页面下方“保存设置”后永久生效。"

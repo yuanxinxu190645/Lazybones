@@ -57,13 +57,13 @@ class Palette:
 PALETTES = {
     "codex_dark": Palette(
         dark=True,
-        bg="#171717", surface="#1E1E1E", surface_alt="#252525",
-        input_bg="#202020", hover="#2C2C2C", border="#383838",
-        text="#F1F1EF", muted="#A2A29D", accent="#D97757",
-        accent_hover="#E48768", accent_text="#171717",
-        selection="#40312C", success="#67B88A", warning="#D6A85F",
+        bg="#181B1F", surface="#21252B", surface_alt="#292E35",
+        input_bg="#252A31", hover="#343B43", border="#404852",
+        text="#E8ECEF", muted="#A6AFB8", accent="#82BCA7",
+        accent_hover="#9BCCB9", accent_text="#132B23",
+        selection="#324F48", success="#81C5A2", warning="#D6A85F",
         danger="#E4777F", link="#83AEFF", highlight="#44362F",
-        log_bg="#111111", code_bg="#151515",
+        log_bg="#1C2025", code_bg="#1C2025",
     ),
     "codex_light": Palette(
         dark=False,
@@ -73,17 +73,17 @@ PALETTES = {
         accent_hover="#B84E2F", accent_text="#FFFFFF",
         selection="#F2DED5", success="#287A4B", warning="#936A19",
         danger="#B83A45", link="#315FA8", highlight="#F8E8C9",
-        log_bg="#1A1A1A", code_bg="#F1F1EE",
+        log_bg="#FAFAF8", code_bg="#F1F1EE",
     ),
     "classic": Palette(
         dark=False,
-        bg="#F0F0F0", surface="#FFFFFF", surface_alt="#E8E8E8",
-        input_bg="#FFFFFF", hover="#E2EAF2", border="#B8B8B8",
-        text="#1A1A1A", muted="#666666", accent="#A8D5B5",
-        accent_hover="#7EC8A0", accent_text="#1A3A2A",
-        selection="#D9EAF7", success="#107C10", warning="#8A5A00",
-        danger="#D13438", link="#0066CC", highlight="#FFF2CC",
-        log_bg="#1E1E1E", code_bg="#F4F4F4",
+        bg="#F2F4F3", surface="#FFFFFF", surface_alt="#F3F6F5",
+        input_bg="#FAFCFB", hover="#E8EEEB", border="#D4DED9",
+        text="#24352E", muted="#66796F", accent="#34765E",
+        accent_hover="#285D4A", accent_text="#FFFFFF",
+        selection="#DDEDE5", success="#287548", warning="#8A5A00",
+        danger="#B43D48", link="#28649A", highlight="#FAF0D8",
+        log_bg="#FAFCFB", code_bg="#F3F6F5",
     ),
 }
 # 极速皮肤沿用经典配色，但使用 clam 原生元素，不创建圆角位图。
@@ -253,21 +253,24 @@ class ThemeManager:
         radius = 6 if self.density == "compact" else 8
         soft_border = self._mix_hex(p.border, p.bg, 0.42)
         variants = {
-            "button": ("TButton", p.surface_alt, p.hover, p.selection,
+            "button": ("TButton", p.surface, p.hover, p.selection,
                        p.surface),
             "accent": ("Accent.TButton", p.accent, p.accent_hover,
                        p.accent_hover, p.surface_alt),
-            "danger": ("Danger.TButton", p.surface_alt, p.highlight,
+            "danger": ("Danger.TButton", p.surface, p.highlight,
                        p.selection, p.surface),
         }
         for role, (style_name, normal, hover, pressed, disabled) in variants.items():
             element = self._rounded_element(
-                role, normal, hover, pressed, disabled, soft_border, radius)
+                role, normal, hover, pressed, disabled,
+                p.accent if role == "accent" else soft_border, radius)
             if element:
                 self.style.layout(style_name, [
                     (element, {"sticky": "nsew", "children": [
                         ("Button.padding", {"sticky": "nsew", "children": [
-                            ("Button.label", {"sticky": "nsew"})
+                            ("Button.focus", {"sticky": "nsew", "children": [
+                                ("Button.label", {"sticky": "nsew"})
+                            ]})
                         ]})
                     ]})
                 ])
@@ -311,7 +314,7 @@ class ThemeManager:
         tab_pad_y = ((3 if compact else 5) if lightweight
                      else (4 if compact else 7))
         base_row_height = ((21 if compact else 25) if lightweight
-                           else (22 if compact else 28))
+                           else (26 if compact else 32))
         row_height = round(base_row_height * self.font_scale / 100)
         base_font = self._font(9)
         soft_border = self._mix_hex(p.border, p.bg, 0.52)
@@ -319,19 +322,27 @@ class ThemeManager:
         self.style.configure(".", background=p.bg, foreground=p.text,
                              font=base_font, bordercolor=p.border,
                              lightcolor=p.border, darkcolor=p.border)
-        self.style.configure("TFrame", background=p.bg)
+        self.style.configure("TFrame", background=p.surface)
+        self.style.configure("Shell.TFrame", background=p.bg)
         self.style.configure("Card.TFrame", background=p.surface)
-        self.style.configure("TLabel", background=p.bg, foreground=p.text)
+        self.style.configure("TLabel", background=p.surface, foreground=p.text)
         self.style.configure("Muted.TLabel", foreground=p.muted)
-        self.style.configure("TLabelframe", background=p.bg,
+        self.style.configure("Brand.TLabel", background=p.bg,
+                             foreground=p.text, font=self._font(18, "bold"))
+        self.style.configure("Shell.TLabel", background=p.bg,
+                             foreground=p.muted)
+        self.style.configure("PageTitle.TLabel", foreground=p.text,
+                             font=self._font(12, "bold"))
+        self.style.configure("TLabelframe", background=p.surface,
                              bordercolor=soft_border, lightcolor=soft_border,
                              darkcolor=soft_border, borderwidth=1,
                              relief="solid")
-        self.style.configure("TLabelframe.Label", background=p.bg,
+        self.style.configure("TLabelframe.Label", background=p.surface,
                              foreground=p.text, font=self._font(9, "bold"))
-        self.style.configure("TButton", background=p.surface_alt,
+        self.style.configure("TButton", background=p.surface,
                              foreground=p.text, bordercolor=p.border,
-                             padding=(9, pad_y), relief="flat")
+                             padding=(10, pad_y), relief="flat", width=0,
+                             focuscolor=p.accent, focusthickness=1)
         self.style.map(
             "TButton",
             background=[("disabled", p.surface), ("active", p.hover),
@@ -343,22 +354,27 @@ class ThemeManager:
                              padding=(10, pad_y), relief="flat")
         self.style.map(
             "Accent.TButton",
-            background=[("active", p.accent_hover),
-                        ("pressed", p.accent_hover),
-                        ("disabled", p.surface_alt)],
+            background=[("disabled", p.surface_alt),
+                        ("active", p.accent_hover),
+                        ("pressed", p.accent_hover)],
             foreground=[("disabled", p.muted)])
-        self.style.configure("Danger.TButton", background=p.surface_alt,
+        self.style.configure("Danger.TButton", background=p.surface,
                              foreground=p.danger, padding=(9, pad_y))
         self.style.map("Danger.TButton",
-                       background=[("active", p.highlight)])
+                       background=[("active", p.highlight)],
+                       foreground=[("disabled", p.muted), ("active", p.danger)])
+        self.style.configure("TMenubutton", background=p.surface,
+                             foreground=p.text, padding=(10, pad_y),
+                             borderwidth=1, relief="solid", arrowcolor=p.muted)
+        self.style.map("TMenubutton", background=[("active", p.hover)])
         if not lightweight:
             self._configure_rounded_controls(pad_y)
         for name in ("TCheckbutton", "TRadiobutton"):
-            self.style.configure(name, background=p.bg, foreground=p.text,
+            self.style.configure(name, background=p.surface, foreground=p.text,
                                  padding=(3, pad_y // 2))
             self.style.map(
                 name,
-                background=[("active", p.bg)],
+                background=[("active", p.surface)],
                 foreground=[("disabled", p.muted), ("active", p.text)],
                 indicatorcolor=[("selected", p.accent),
                                 ("!selected", p.input_bg)])
@@ -394,11 +410,12 @@ class ThemeManager:
         self.style.map(
             "TNotebook.Tab",
             background=[("selected", p.surface), ("active", p.hover)],
-            foreground=[("selected", p.text), ("active", p.text)],
+            foreground=[("selected", p.accent), ("active", p.text)],
             expand=[("selected", (0, 0, 0, 1))])
         self.style.configure("Treeview", background=p.surface,
                              fieldbackground=p.surface, foreground=p.text,
-                             bordercolor=soft_border, rowheight=row_height)
+                             bordercolor=soft_border, rowheight=row_height,
+                             relief="flat", borderwidth=0)
         self.style.map("Treeview",
                        background=[("selected", p.selection)],
                        foreground=[("selected", p.text)])
@@ -413,7 +430,7 @@ class ThemeManager:
                              bordercolor=p.border, lightcolor=p.accent,
                              darkcolor=p.accent)
         self.style.configure("TSeparator", background=p.border)
-        self.style.configure("TPanedwindow", background=p.border)
+        self.style.configure("TPanedwindow", background=p.surface_alt)
         for name in ("TScrollbar", "Vertical.TScrollbar",
                      "Horizontal.TScrollbar"):
             self.style.configure(name, background=p.surface_alt,
@@ -433,8 +450,10 @@ class ThemeManager:
     def apply_widget(self, widget: tk.Misc):
         p = self.palette
         try:
-            if isinstance(widget, (tk.Tk, tk.Toplevel, tk.Frame)):
+            if isinstance(widget, (tk.Tk, tk.Toplevel)):
                 widget.configure(bg=p.bg)
+            elif isinstance(widget, tk.Frame):
+                widget.configure(bg=p.surface)
             elif isinstance(widget, tk.Label):
                 role = getattr(widget, "_theme_role", "")
                 foreground = {
@@ -442,7 +461,7 @@ class ThemeManager:
                     "warning": p.warning, "danger": p.danger,
                     "accent": p.accent,
                 }.get(role, p.text)
-                background = p.surface_alt if role == "status" else p.bg
+                background = p.bg if role == "status" else p.surface
                 widget.configure(bg=background, fg=foreground)
                 self._scale_widget_font(widget)
             elif isinstance(widget, tk.Button):
@@ -459,6 +478,8 @@ class ThemeManager:
                 widget.configure(bg=p.surface, fg=p.text,
                                  selectbackground=p.selection,
                                  selectforeground=p.text,
+                                 relief=tk.FLAT, borderwidth=0,
+                                 highlightthickness=1,
                                  highlightbackground=p.border,
                                  highlightcolor=p.accent)
                 self._scale_widget_font(widget)
@@ -470,6 +491,8 @@ class ThemeManager:
                                  insertbackground=p.text,
                                  selectbackground=p.link,
                                  selectforeground=selection_text,
+                                 relief=tk.FLAT, borderwidth=0,
+                                 highlightthickness=1, padx=10, pady=8,
                                  highlightbackground=p.border,
                                  highlightcolor=p.accent)
                 self._scale_widget_font(widget)
@@ -488,7 +511,7 @@ class ThemeManager:
                                  highlightcolor=p.accent)
                 self._scale_widget_font(widget)
             elif isinstance(widget, tk.Canvas):
-                widget.configure(bg=p.bg, highlightbackground=p.border)
+                widget.configure(bg=p.surface, highlightbackground=p.border)
             elif isinstance(widget, tk.Menu):
                 widget.configure(bg=p.surface, fg=p.text,
                                  activebackground=p.selection,

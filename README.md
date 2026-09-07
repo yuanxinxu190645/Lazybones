@@ -17,6 +17,17 @@
 
 ## ✨ 功能特性 / Features
 
+### 最新源码更新 / Latest source updates
+
+- 导航调整为“数据库建立”和“AI 资料包”两个一级标签；文献抽取、内容审核、数据管理位于数据库建立下，偏好设置由右上角按钮进入。
+- 统一经典、深浅色和极速皮肤的显示层级，优化工具栏、滚动与连续缩放时的重排。
+- 新增独立的本地 [AI 资料包](docs/AI资料包.md)：PDF / DOCX 转 Markdown、表格和可选图像附件，提供保守分包、来源页码、OCR 风险报告及 ZIP 导出，不自动上传、不写入文献库。
+- 文件变小不代表上下文无限；图文包可能更大，复杂公式、OCR 和阅读顺序仍需核对。旧版 DOC 请先另存为 DOCX。
+
+以上更新已包含在当前源码中；现有 `v1.4.0` Release 便携包未包含这批更新。
+
+The current source includes reorganized navigation, refreshed themes, resize/scroll improvements, and a separate local AI-bundle workspace. It exports PDF/DOCX text, tables, optional visuals, source-aware chunks, and quality reports without uploading documents. Smaller files do not bypass model context limits. These changes are not included in the existing v1.4.0 portable release.
+
 - 📄 **批量导入文献** — 支持 PDF / TXT 格式，一次处理数十篇文献，自动识别并合并 SI 附件
   **Batch literature import** — Supports PDF / TXT formats; automatically detects and merges Supplementary Information files
 
