@@ -7,6 +7,8 @@ from PyInstaller.utils.hooks import collect_all
 datas = [
     ("prompts/v1.0_basic.yaml", "prompts"),
     ("Readme.yaml", "."),
+    ("README.md", "."),
+    ("docs/AI资料包.md", "docs"),
     ("icon.ico", "."),
     ("dist-tools/LazybonesUpdater.exe", "."),
 ]

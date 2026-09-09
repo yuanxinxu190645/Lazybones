@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -41,7 +42,16 @@ def clean_dir(path: Path) -> None:
 
 
 def run(*args: str) -> None:
-    subprocess.run(list(args), cwd=ROOT, check=True)
+    environment = os.environ.copy()
+    # A venv created from Conda can import extensions via Conda's DLL setup,
+    # while PyInstaller's dependency scan cannot find the same DLLs on PATH.
+    # Scope these search paths to build subprocesses; do not change user settings.
+    runtime = Path(sys.base_prefix)
+    dll_dirs = [runtime, runtime / "Library" / "bin", runtime / "DLLs"]
+    environment["PATH"] = os.pathsep.join(
+        [str(path) for path in dll_dirs if path.is_dir()]
+        + [environment.get("PATH", "")])
+    subprocess.run(list(args), cwd=ROOT, check=True, env=environment)
 
 
 def write_manifest(portable_dir: Path) -> Path:
@@ -74,6 +84,8 @@ def write_manifest(portable_dir: Path) -> Path:
 def create_zip(portable_dir: Path, release_dir: Path) -> Path:
     release_dir.mkdir(parents=True, exist_ok=True)
     asset = release_dir / portable_asset_name(APP_VERSION)
+    if asset.exists():
+        raise FileExistsError("拒绝覆盖已有便携包，请使用新版本号：" + str(asset))
     root_name = asset.stem
     with zipfile.ZipFile(asset, "w", zipfile.ZIP_DEFLATED,
                          compresslevel=9) as archive:
@@ -103,7 +115,8 @@ def main() -> int:
     clean_dir(ROOT / "build" / "portable")
     clean_dir(ROOT / "dist-tools")
     clean_dir(ROOT / "dist" / "Lazybones")
-    clean_dir(ROOT / "release")
+    # Preserve historical release ZIPs and version-specific checksum sidecars.
+    (ROOT / "release").mkdir(exist_ok=True)
 
     run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--distpath", "dist-tools", "--workpath", "build/updater",

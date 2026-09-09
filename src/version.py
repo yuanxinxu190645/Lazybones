@@ -1,6 +1,6 @@
 """Application and release-channel identity."""
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 GITHUB_REPOSITORY = "yuanxinxu190645/Lazybones"
 GITHUB_RELEASES_URL = (
     "https://github.com/" + GITHUB_REPOSITORY + "/releases"

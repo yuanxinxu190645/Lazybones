@@ -24,9 +24,9 @@
 - 新增独立的本地 [AI 资料包](docs/AI资料包.md)：PDF / DOCX 转 Markdown、表格和可选图像附件，提供保守分包、来源页码、OCR 风险报告及 ZIP 导出，不自动上传、不写入文献库。
 - 文件变小不代表上下文无限；图文包可能更大，复杂公式、OCR 和阅读顺序仍需核对。旧版 DOC 请先另存为 DOCX。
 
-以上更新已包含在当前源码中；现有 `v1.4.0` Release 便携包未包含这批更新。
+以上更新包含在 `v1.4.1` 源码及便携包中。`v1.4.0` 历史版本保留。
 
-The current source includes reorganized navigation, refreshed themes, resize/scroll improvements, and a separate local AI-bundle workspace. It exports PDF/DOCX text, tables, optional visuals, source-aware chunks, and quality reports without uploading documents. Smaller files do not bypass model context limits. These changes are not included in the existing v1.4.0 portable release.
+Version 1.4.1 includes reorganized navigation, refreshed themes, resize/scroll improvements, and a separate local AI-bundle workspace. It exports PDF/DOCX text, tables, optional visuals, source-aware chunks, and quality reports without uploading documents. Smaller files do not bypass model context limits. The historical v1.4.0 portable release is preserved.
 
 - 📄 **批量导入文献** — 支持 PDF / TXT 格式，一次处理数十篇文献，自动识别并合并 SI 附件
   **Batch literature import** — Supports PDF / TXT formats; automatically detects and merges Supplementary Information files
